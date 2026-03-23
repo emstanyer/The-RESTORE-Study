@@ -1,0 +1,702 @@
+---
+title: "Unified Sleep Analysis: Diary & Actigraphy"
+author: "Emily Stanyer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    df_print: paged
+params:
+  diary_dir: "Data/raw/sleep_diary/"
+  actig_dir: "Data/raw/actigraphy/"
+  eeg_path: "Data/processed/EEG/clean_EEG_data.xlsx"
+  out_dir: "Output/combined_analysis"
+  fig_dir: "Figures/combined_analysis"
+  clean_dir: "Data/processed/sleep_diary"   
+---
+
+```{r, setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Load libraries
+library(tidyverse); library(lme4); library(emmeans)
+library(flextable); library(officer); library(readxl); library(here)
+
+# Define unified paths
+out_dir <- here::here(params$out_dir)
+fig_dir <- here::here(params$fig_dir)
+clean_dir <- here::here(params$clean_dir) 
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# EEG data to anchor to SRT dates
+eeg_clean <- readxl::read_excel(here::here(params$eeg_path))
+srt_anchors <- eeg_clean %>%
+  filter(str_detect(Original_filename, "SRT_NIGHT1")) %>%
+  mutate(
+    raw_date = str_extract(Original_filename, "\\d{8}"),
+    raw_time = str_extract(Original_filename, "(?<=_\\d{8}_)\\d{4}"),
+    srt_start_date = as.Date(lubridate::dmy_hm(paste(raw_date, raw_time))),
+    Real_ID = str_pad(as.character(Real_ID), width = 3, side = "left", pad = "0")
+  ) %>%
+  select(Real_ID, srt_start_date) %>%
+  distinct()
+
+```
+
+# 1. Read sleep diary data
+```{r, 1-read-diary-data}
+
+# Use here() to ensure the path starts from the project root
+raw_diary_path <- here::here(params$diary_dir, "sleep_diary_raw.csv")
+
+# Verify if the file actually exists before reading
+if (!file.exists(raw_diary_path)) {
+  stop(paste("File not found at:", raw_diary_path))
+}
+
+raw_diary_data <- read.csv(raw_diary_path)
+
+
+library(tidyverse)
+library(lubridate)
+
+# Define PANAS to strip this from diary data
+panas_to_remove <- c(
+  "Interested", "Distressed", "Excited", "Upset", "Strong", "Guilty", 
+  "Scared", "Hostile", "Enthusiastic", "Proud", "Irritable", "Alert", 
+  "Ashamed", "Inspired", "Nervous", "Determined", "Attentive", "Jittery", 
+  "Active", "Afraid", "Sum.positive", "Sum.negative", "Complete"
+)
+
+# Robust parser for SOL and WASO strings
+parse_to_mins_robust <- function(x) {
+  case_when(
+    is.na(x) | x == "" ~ 0,
+    str_detect(x, ":") ~ as.numeric(hm(x)) / 60,
+    str_detect(x, "hour") ~ as.numeric(str_extract(x, "\\d+")) * 60,
+    TRUE ~ as.numeric(str_extract(x, "\\d+"))
+  )
+}
+
+diary_processed <- raw_diary_data %>%
+  rename(Id = Record.ID) %>%
+  # Remove PANAS and empty X columns
+  select(-matches(paste0("^(", paste(panas_to_remove, collapse="|"), ")\\.+"))) %>%
+  select(-matches("^X(\\.\\.\\.\\d+)?$")) %>%
+  # Pivot to long format: handles variable dots between name and day number
+  pivot_longer(
+    cols = contains("."), 
+    names_to = c(".value", "day"),
+    names_pattern = "(.*)\\.+(\\d+)$"
+  ) %>%
+  rename_with(~str_remove(., "\\.+$")) %>%
+  # Flexible renaming using matches to catch "fall.asleep...22" etc.
+  rename(
+    survey_completed = matches("Survey.Timestamp"),
+    Date             = matches("Today.s.date"),
+    bed_time         = matches("get.into.bed"),
+    try_sleep        = matches("try.to.fall.asleep"),
+    SOL_raw          = matches("take.you.to.fall.asleep"),
+    n_wakes          = matches("wake.up..not.counting"),
+    WASO_raw         = matches("awakenings.last"),
+    wake_time        = matches("final.awakening"),
+    rise_time        = matches("get.out.of.bed"),
+    TST_raw          = matches("long.did.you.sleep"),
+    sleep_quality    = matches("quality.of.your.sleep")
+  ) %>%
+  # Start Cleaning
+  filter(!is.na(bed_time) & bed_time != "") %>%
+  mutate(
+    Id = str_pad(as.character(Id), width = 3, side = "left", pad = "0"),
+    day = as.numeric(day),
+    Date = as.Date(Date),
+    
+    bed_time = if_else(Id == "008" & day == 10 & str_detect(bed_time, "07:00"),
+                       str_replace(bed_time, "07:00", "19:00"), bed_time),
+    
+    # Parse Durations
+    SOL_mins  = parse_to_mins_robust(SOL_raw),
+    WASO_mins = parse_to_mins_robust(WASO_raw),
+    TST_hours = case_when(
+      str_detect(as.character(TST_raw), ":") ~ as.numeric(hm(TST_raw)) / 3600,
+      TRUE ~ as.numeric(TST_raw)
+    ),
+    
+    # Parse Timestamps
+    bed_datetime  = parse_date_time(bed_time, orders = c("ymd HMS", "ymd HM")),
+    rise_datetime = parse_date_time(rise_time, orders = c("ymd HMS", "ymd HM")),
+    
+    # TIB and SE Calculation
+    raw_TIB = as.numeric(difftime(rise_datetime, bed_datetime, units = "hours")),
+    TIB_hours = if_else(raw_TIB < 0, raw_TIB + 24, raw_TIB),
+    SE = (TST_hours / TIB_hours) * 100
+  ) %>%
+  mutate(
+    SE = pmin(pmax(ifelse(is.nan(SE) | is.infinite(SE), NA, SE), 0), 100)
+  )
+
+#  remove raw columns
+diary_final <- diary_processed %>%
+  select(Id, day, Date, SOL_mins, WASO_mins, TST_hours, TIB_hours, SE, everything()) %>%
+  select(-any_of(c("SOL_raw", "WASO_raw", "TST_raw", "raw_TIB", "X", "Sleep.efficiency")), 
+         -matches("Notes|Note|\\.\\.")) %>%
+  filter(day <= 42) %>%
+  arrange(Id, day)
+
+head(diary_final)
+
+# save diary final
+write_csv(diary_final, file.path(clean_dir, "diary_data_clean.csv"))
+```
+
+# 2. Read actigraphy data
+```{r, import-and-align-actigraphy}
+# 1. Define Paths (Required for standalone run)
+path_to_files <- here::here("Data", "raw", "actigraphy")
+clean_dir     <- here::here("Data", "processed", "actigraphy")
+
+# 2. Re-create SRT_anchors (The Ground Truth from EEG)
+eeg_clean <- readxl::read_excel(here::here("Data/processed/EEG/clean_EEG_data.xlsx"))
+
+srt_anchors <- eeg_clean %>%
+  filter(str_detect(Original_filename, "SRT_NIGHT1")) %>%
+  mutate(
+    raw_date = str_extract(Original_filename, "\\d{8}"),
+    raw_time = str_extract(Original_filename, "(?<=_\\d{8}_)\\d{4}"),
+    srt_start_date = as.Date(lubridate::dmy_hm(paste(raw_date, raw_time))),
+    Real_ID = stringr::str_pad(as.character(Real_ID), width = 3, side = "left", pad = "0")
+  ) %>%
+  select(Real_ID, srt_start_date) %>%
+  distinct()
+
+# 3. Load Actigraphy Files
+file_list <- list.files(path = path_to_files, pattern = "\\.xlsx$", full.names = TRUE)
+if (length(file_list) == 0) stop("No .xlsx files found in actigraphy path.")
+
+actigraphy_raw <- map_df(file_list, ~{
+  fname <- basename(.x)
+  readxl::read_excel(.x, sheet = 1) %>%
+    mutate(id = substr(fname, 1, 2), Timepoint = substr(fname, 4, 6))
+}) %>% rename(Variable = Day)
+
+# 4. Extract Calendar Dates (Handling Excel numeric dates)
+actigraphy_date_ref <- actigraphy_raw %>%
+  filter(Variable == "Start day") %>%
+  pivot_longer(cols = matches("^[0-9]+$"), names_to = "Day", values_to = "Value") %>%
+  mutate(
+    ActualDate = as.Date(as.numeric(Value), origin = "1899-12-30"),
+    id = str_pad(id, width = 3, side = "left", pad = "0"),
+    Day = as.integer(Day)
+  ) %>%
+  filter(!is.na(ActualDate)) %>% 
+  select(id, Timepoint, Day, ActualDate)
+
+# 5. Align Metrics with Anchors
+actigraphy_4weeks <- actigraphy_raw %>%
+  filter(!Variable %in% c("Start day", "Day of week", "End day")) %>%
+  pivot_longer(cols = matches("^[0-9]+$"), names_to = "Day", values_to = "Value") %>%
+  # Filter out non-numeric placeholders
+  filter(!Value %in% c("Min", "Average", "Max", "-", "NA")) %>%
+  mutate(
+    id = str_pad(id, width = 3, side = "left", pad = "0"),
+    Day = as.integer(Day),
+    Value = as.numeric(Value)
+  ) %>%
+  inner_join(actigraphy_date_ref, by = c("id", "Timepoint", "Day")) %>%
+  left_join(srt_anchors, by = c("id" = "Real_ID")) %>%
+  mutate(
+    day_relative_to_srt = as.numeric(ActualDate - srt_start_date),
+    Phase = if_else(ActualDate < srt_start_date, "BSL", "SRT"),
+    Week = case_when(
+      Phase == "BSL" ~ "Baseline",
+      day_relative_to_srt >= 0  & day_relative_to_srt <= 6  ~ "Week 1",
+      day_relative_to_srt >= 7  & day_relative_to_srt <= 13 ~ "Week 2",
+      day_relative_to_srt >= 14 & day_relative_to_srt <= 20 ~ "Week 3",
+      day_relative_to_srt >= 21 & day_relative_to_srt <= 27 ~ "Week 4",
+      TRUE ~ "Exclude"
+    ),
+    Week = factor(Week, levels = c("Baseline", "Week 1", "Week 2", "Week 3", "Week 4"))
+  ) %>%
+  filter(Week != "Exclude", !is.na(Value))
+
+ # save actigraphy data
+write_csv(actigraphy_4weeks, file.path(clean_dir, "actigraphy_data.csv"))
+library(lubridate)
+
+# --- 1. Target only the Clock-Time Variables ---
+sleep_timing_vars <- c("Lights out", "Fell asleep", "Woke up", "Got up")
+
+actigraphy_for_collab <- actigraphy_4weeks %>%
+  # Filter to just the timing rows
+  filter(Variable %in% sleep_timing_vars) %>%
+  mutate(
+    # Ensure decimals are treated as doubles
+    Value_num = as.double(Value),
+    
+    # 2. Convert Decimal to Clock Time
+    Clock_Time = hms::as_hms(round(Value_num * 86400)),
+    
+    # 3. Apply Midnight Logic
+    # Bedtime variables occurring late (Value > 0.5) happened the night before
+    Corrected_Date = case_when(
+      Variable %in% c("Lights out", "Fell asleep") & Value_num > 0.5 ~ ActualDate - lubridate::days(1),
+      TRUE ~ ActualDate
+    ),
+    
+    # 4. Create the final DateTime
+    Full_DateTime = as.POSIXct(paste(Corrected_Date, Clock_Time), tz = "UTC"),
+    DateTime_Friendly = format(Full_DateTime, "%d/%m/%Y %H:%M")
+  ) %>%
+  # 5. Clean up for the collaborator
+  select(id, Week, Day, Variable, Full_DateTime) %>%
+  arrange(id, Full_DateTime)
+
+# Check the results
+print(head(actigraphy_for_collab))
+
+```
+
+# 3. Clean actigraphy & align with EEG
+```{r, actigraphy-conversion-and-export}
+# 1. Define metric categories
+vars_to_mins <- c("Actual sleep time", "Time in bed", "Sleep latency", "Actual wake time")
+time_cols    <- c("Lights out", "Fell asleep", "Woke up", "Got up")
+target_metrics <- c(vars_to_mins, time_cols, "Sleep efficiency (%)", "Central Phase Measure (min)")
+
+# 2. Reshape and Transform
+actigraphy_final_wide <- actigraphy_4weeks %>%
+  filter(Variable %in% target_metrics) %>%
+  # Handle potential duplicates (mean) to ensure clean pivot
+  group_by(id, Week, ActualDate, day_relative_to_srt, Variable) %>%
+  summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = Variable, values_from = Value) %>%
+  # 3. Apply maths (1440 for mins, 86400 for hms)
+  mutate(
+    across(any_of(vars_to_mins), ~ .x * 1440),
+    across(any_of(time_cols),    ~ hms::as_hms(.x * 86400))
+  ) %>%
+  # 4. Standardise column names
+  rename(
+    TST  = `Actual sleep time`,
+    TIB  = `Time in bed`,
+    SOL  = `Sleep latency`,
+    SE   = `Sleep efficiency (%)`,
+    WASO = `Actual wake time`,
+    midpoint_sleep = `Central Phase Measure (min)`
+  ) %>%
+  arrange(id, ActualDate)
+
+# 5. Save
+write_csv(actigraphy_final_wide, file.path(clean_dir, "actigraphy_data_clean.csv"))
+head(actigraphy_final_wide)
+```
+
+# 4. Align with EEG data
+```{r, 3-align-eeg}
+
+library(tidyverse)
+library(lubridate)
+library(readxl)
+
+# 1. Read the processed EEG data
+eeg_clean <- read_excel(here::here("Data/processed/EEG/clean_EEG_data.xlsx"))
+
+# 2. Extract the SRT Night 1 anchor date for each participant
+# This date is the "Ground Truth" for when treatment started
+srt_anchors <- eeg_clean %>%
+  filter(str_detect(Original_filename, "SRT_NIGHT1")) %>%
+  mutate(
+    # Extract date (8 digits) and time (4 digits) from filename
+    raw_date = str_extract(Original_filename, "\\d{8}"),
+    raw_time = str_extract(Original_filename, "(?<=_\\d{8}_)\\d{4}"),
+    
+    # Create a full POSIXct timestamp and extract the Date
+    srt_start_timestamp = dmy_hm(paste(raw_date, raw_time)),
+    srt_start_date = as.Date(srt_start_timestamp),
+    
+    # Standardize ID to 3 digits (e.g., "006")
+    Real_ID = str_pad(as.character(Real_ID), width = 3, side = "left", pad = "0")
+  ) %>%
+  select(Real_ID, srt_start_date) %>%
+  distinct()
+
+# 3. Apply labels and calculate study weeks
+# We use the diary_final created in the previous chunk
+diary_labeled <- diary_final %>%
+  mutate(
+    Id = str_pad(as.character(Id), width = 3, side = "left", pad = "0"),
+    diary_date_obj = as.Date(Date)
+  ) %>%
+  # Join with our EEG Anchor
+  left_join(srt_anchors, by = c("Id" = "Real_ID")) %>%
+  # Define Phase and Relative Days
+  mutate(
+    Phase = case_when(
+      diary_date_obj < srt_start_date  ~ "BSL",
+      diary_date_obj >= srt_start_date ~ "SRT",
+      TRUE ~ "Unknown" # For participants without an SRT Night 1 EEG
+    ),
+    day_relative_to_srt = as.numeric(diary_date_obj - srt_start_date)
+  )
+
+# 4. Create strict 4-week SRT groups
+diary_4weeks <- diary_labeled %>%
+  mutate(
+    Week = case_when(
+      Phase == "BSL" ~ "Baseline",
+      # Logic: 7-day windows starting from Day 0 (the anchor night)
+      Phase == "SRT" & day_relative_to_srt >= 0 & day_relative_to_srt <= 6  ~ "Week 1",
+      Phase == "SRT" & day_relative_to_srt >= 7 & day_relative_to_srt <= 13 ~ "Week 2",
+      Phase == "SRT" & day_relative_to_srt >= 14 & day_relative_to_srt <= 20 ~ "Week 3",
+      Phase == "SRT" & day_relative_to_srt >= 21 & day_relative_to_srt <= 27 ~ "Week 4",
+      TRUE ~ "Exclude" 
+    ),
+    Week = factor(Week, levels = c("Baseline", "Week 1", "Week 2", "Week 3", "Week 4"))
+  ) %>%
+  filter(Week != "Exclude")
+
+# 5. Verification of the Study Window
+summary_check <- diary_4weeks %>%
+  group_by(Week) %>%
+  summarise(
+    start_day = min(day_relative_to_srt, na.rm = TRUE),
+    end_day   = max(day_relative_to_srt, na.rm = TRUE),
+    n_entries = n(),
+    .groups = "drop"
+  )
+
+print(summary_check)
+
+```
+
+# 5. Plot sleep diary and actigraphy variables
+```{r, 2-plot-diary-data}
+
+# 1. Load Required Libraries
+library(tidyverse)
+library(ggprism) # Optional, for academic axis styling
+library(patchwork) # In case you want to combine plots later
+
+# 2. Define Publication Palette
+sleep_palette <- c(
+  "Sleep Diary" = "#31446b", 
+  "Actigraphy"  = "#666991", 
+  "EEG"         = "#d6bdde"
+)
+
+# --- 3. DATA CONSOLIDATION ---
+
+# A. Process Sleep Diary Summary
+sd_summary <- diary_4weeks %>%
+  mutate(
+    TIB = as.numeric(TIB_hours) * 60,
+    TST = as.numeric(TST_hours) * 60,
+    SOL = as.numeric(SOL_mins),
+    WASO = as.numeric(WASO_mins),
+    SE = as.numeric(SE)
+  ) %>%
+  select(Id, Week, TIB, TST, SOL, WASO, SE) %>%
+  pivot_longer(cols = c(TIB, TST, SOL, WASO, SE), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    Source = "Sleep Diary",
+    week_label = dplyr::recode(Week, "Baseline"="BSL", "Week 1"="1", "Week 2"="2", "Week 3"="3", "Week 4"="4")
+  )
+
+# B. Process Actigraphy Summary
+act_summary <- actigraphy_final_wide %>%
+  select(id, Week, TIB, TST, SOL, WASO, SE) %>%
+  pivot_longer(cols = c(TIB, TST, SOL, WASO, SE), names_to = "variable", values_to = "value") %>%
+  filter(!is.na(value)) %>%
+  mutate(
+    Source = "Actigraphy",
+    Id = id,
+    week_label = dplyr::recode(Week, "Baseline"="BSL", "Week 1"="1", "Week 2"="2", "Week 3"="3", "Week 4"="4")
+  )
+
+# C. Process EEG Summary
+# C. Process EEG Summary (Fixed for Data Type Error)
+eeg_summary <- eeg_clean %>%
+  mutate(
+    Id = str_pad(as.character(Real_ID), width = 3, side = "left", pad = "0"),
+    day_num = as.numeric(day),
+    week_label = case_when(
+      Timepoint == "BSL" ~ "BSL",
+      day_num >= 0  & day_num <= 6  ~ "1",
+      day_num >= 7  & day_num <= 13 ~ "2",
+      day_num >= 14 & day_num <= 20 ~ "3",
+      day_num >= 21 & day_num <= 27 ~ "4",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # 1. Rename to standardized names
+  rename(
+    TIB = `TIB (mins)`, TST = `TST (mins)`, 
+    WASO = `WASO (mins)`, SE = `Sleep Efficiency (%)`, SOL = `SOL (mins)`
+  ) %>%
+  # 2. FORCE NUMERIC (The Fix)
+  # This converts any text/character columns to numbers safely
+  mutate(across(c(TIB, TST, WASO, SE, SOL), ~ as.numeric(as.character(.)))) %>%
+  # 3. Pivot and clean
+  select(Id, week_label, TIB, TST, SOL, WASO, SE) %>%
+  pivot_longer(cols = c(TIB, TST, SOL, WASO, SE), names_to = "variable", values_to = "value") %>%
+  mutate(Source = "EEG") %>%
+  filter(!is.na(week_label), !is.na(value))
+
+# --- 4. COMBINE AND CALCULATE STATS ---
+
+combined_plot_df <- bind_rows(sd_summary, act_summary, eeg_summary) %>%
+  mutate(
+    week_label = factor(week_label, levels = c("BSL", "1", "2", "3", "4")),
+    variable = factor(variable, levels = c("TIB", "TST", "SOL", "WASO", "SE"))
+  ) %>%
+  group_by(week_label, variable, Source) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    sd   = sd(value, na.rm = TRUE),
+    n    = n_distinct(Id),
+    se   = sd / sqrt(pmax(n, 1)),
+    .groups = "drop"
+  )
+
+# --- 5. CREATE THE PLOT ---
+
+plot_continuity <- ggplot(combined_plot_df, aes(x = week_label, y = mean, color = Source, group = Source, shape = Source)) +
+  # Geoms
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  geom_point(size = 3) +
+  
+  # Faceting
+  facet_wrap(~ variable, scales = "free_y", nrow = 1,
+             labeller = labeller(variable = c(
+               TIB = "TIB (mins)", TST = "TST (mins)",
+               SOL = "SOL (mins)", WASO = "WASO (mins)", SE = "SE (%)"
+             ))) +
+  
+  # Aesthetics
+  scale_color_manual(values = sleep_palette) +
+  expand_limits(y = 0) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.8),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 11, face = "bold"),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(x = "Week", y = "Mean ± SE")
+
+# 6. Save and Display
+print(plot_continuity)
+
+ggsave(
+  filename = here::here("Figures/combined_analysis", "Sleep_Continuity_Comparison.png"), 
+  plot = plot_continuity,
+  width = 12, height = 6, dpi = 300, bg = "white"
+)
+```
+
+# 6. Linear mixed model for both and table with both in (sleep diary first)
+```{r, conduct weekly-lmm, message=FALSE, warning=FALSE}
+
+get_unified_stats <- function(df, v, is_actig = FALSE) {
+  
+  # 1. Fully Vectorized Clock Helper
+  to_clock_vec <- function(m_vec) {
+    if (all(is.na(m_vec))) return(rep(NA_character_, length(m_vec)))
+    
+    # We use abs() for the math and then re-apply the sign for differences
+    hours <- as.integer(abs(m_vec) / 60)
+    mins  <- as.integer(round(abs(m_vec) %% 60))
+    
+    # Handle the sign (important for the 'Diff' column)
+    sign_char <- ifelse(!is.na(m_vec) & m_vec < -0.5, "-", "") 
+    
+    ifelse(is.na(m_vec), 
+           NA_character_, 
+           sprintf("%s%02d:%02d", sign_char, hours, mins))
+  }
+
+  # 2. Universal Data Prep
+  df_mod <- df %>%
+    rename_with(~"Id", matches("^id$|^Id$")) %>%
+    rename_with(~"Week_Orig", matches("^week$|^Week$"))
+
+  if (v %in% colnames(df_mod)) {
+    df_mod$Value <- as.numeric(df_mod[[v]])
+  } else if ("Variable" %in% colnames(df_mod)) {
+    df_mod <- df_mod %>% filter(Variable == v) %>% mutate(Value = as.numeric(Value))
+  } else { return(NULL) }
+
+  if (str_detect(v, "hours")) { df_mod$Value <- df_mod$Value * 60 }
+
+  df_mod <- df_mod %>%
+    mutate(Week = factor(dplyr::recode(Week_Orig, "Baseline"="BSL", "Week 1"="1", "Week 2"="2", "Week 3"="3", "Week 4"="4"),
+                        levels = c("BSL", "1", "2", "3", "4"))) %>%
+    filter(!is.na(Value)) %>%
+    group_by(Id, Week) %>%
+    summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop")
+
+  # 3. Descriptive Stats
+  desc <- df_mod %>%
+    group_by(Week) %>%
+    summarise(m = mean(Value), s = sd(Value), .groups = "drop")
+  
+  # Logic for Mean (SD) column
+  if (v == "midpoint_sleep") {
+    desc <- desc %>% 
+      mutate(mean_sd = paste0(to_clock_vec(m), " (", to_clock_vec(s), ")"))
+  } else {
+    desc <- desc %>% 
+      mutate(mean_sd = sprintf("%.2f (%.2f)", m, s))
+  }
+
+  # 4. Model & Contrasts
+  fit <- lme4::lmer(Value ~ Week + (1|Id), data = df_mod, 
+                    control = lmerControl(optimizer = "nloptwrap", optCtrl = list(maxfun = 1e6)))
+  em <- emmeans::emmeans(fit, ~ Week)
+  ct <- as.data.frame(emmeans::contrast(em, method = "trt.vs.ctrl", ref = 1, infer = TRUE))
+  ct$week_num <- stringr::str_extract(ct$contrast, "\\d")
+
+  # 5. Cohen's dx
+  wide_df <- df_mod %>% pivot_wider(names_from = Week, values_from = Value)
+  d_vals <- map_dbl(ct$week_num, function(w) {
+    if(w %in% names(wide_df) && "BSL" %in% names(wide_df)) {
+      diffs <- na.omit(wide_df[[w]] - wide_df$BSL)
+      if(length(diffs) > 1) mean(diffs) / sd(diffs) else NA_real_
+    } else NA_real_
+  })
+
+  # 6. Formatting
+  bsl_row <- data.frame(
+    Week = "Baseline", 
+    Mean_SD = desc$mean_sd[desc$Week == "BSL"], 
+    Diff = "", CI = "", d = ""
+  )
+  
+  trt_rows <- ct %>%
+    mutate(
+      Week = paste("Week", week_num),
+      Mean_SD = desc$mean_sd[match(week_num, desc$Week)],
+      d = sprintf("%.2f", d_vals)
+    )
+  
+  # Specific formatting for Midpoint Diff and CI
+  if (v == "midpoint_sleep") {
+    trt_rows <- trt_rows %>%
+      mutate(
+        Diff = to_clock_vec(estimate),
+        CI = paste0(to_clock_vec(lower.CL), " to ", to_clock_vec(upper.CL))
+      )
+  } else {
+    trt_rows <- trt_rows %>%
+      mutate(
+        Diff = sprintf("%.2f", estimate),
+        CI = sprintf("%.2f to %.2f", lower.CL, upper.CL)
+      )
+  }
+
+  return(trt_rows %>% 
+           select(Week, Mean_SD, Diff, CI, d) %>%
+           bind_rows(bsl_row, .) %>% 
+           mutate(Metric = v, Source = ifelse(is_actig, "Actigraphy", "Sleep Diary")))
+}
+```
+
+# 7. Run LMM on sleep diary and actigraphy data
+```{r}
+# Define Variables
+diary_vars <- c("TIB_hours", "TST_hours", "SOL_mins", "WASO_mins", "SE")
+actig_vars <- c("TIB", "TST", "SOL", "WASO", "SE", "midpoint_sleep")
+
+# Execute
+diary_stats <- map_df(diary_vars, ~get_unified_stats(diary_4weeks, .x, is_actig = FALSE))
+actig_stats <- map_df(actig_vars, ~get_unified_stats(actigraphy_final_wide, .x, is_actig = TRUE))
+
+# Calculate Ns
+n_diary <- n_distinct(diary_4weeks$Id)
+n_actig <- n_distinct(actigraphy_final_wide$id)
+
+# 1. Prepare the data: Merge and clean labels
+table_data <- bind_rows(diary_stats, actig_stats) %>%
+  mutate(
+    Metric = recode(Metric, 
+                    "TIB_hours" = "TIB (mins)", "TST_hours" = "TST (mins)",
+                    "SOL_mins" = "SOL (mins)", "WASO_mins" = "WASO (mins)", 
+                    "TIB" = "TIB (mins)", "TST" = "TST (mins)", "SOL" = "SOL (mins)",
+                    "WASO" = "WASO (mins)", "SE" = "SE (%)", "midpoint_sleep" = "Midpoint (HH:MM)"),
+    Source = recode(Source, 
+                    "Sleep Diary" = paste0("SLEEP DIARY (N = ", n_diary, ")"),
+                    "Actigraphy"  = paste0("ACTIGRAPHY (N = ", n_actig, ")"))
+  )
+
+# 2. Create the grouped structure
+# We group by Source (Section Header) and Metric (Variable Header)
+grouped_df <- as_grouped_data(x = table_data, groups = c("Source", "Metric"))
+
+
+         # 1. Prepare the data
+# 1. Prepare the data
+# 1. Prepare data with a "First in Source" flag
+table_prep <- bind_rows(diary_stats, actig_stats) %>%
+  mutate(
+    Metric = recode(Metric, 
+                    "TIB_hours" = "TIB (mins)", "TST_hours" = "TST (mins)",
+                    "SOL_mins" = "SOL (mins)", "WASO_mins" = "WASO (mins)", 
+                    "TIB" = "TIB (mins)", "TST" = "TST (mins)", "SOL" = "SOL (mins)",
+                    "WASO" = "WASO (mins)", "SE" = "SE (%)", "midpoint_sleep" = "Midpoint (HH:MM)"),
+    Source = recode(Source, 
+                    "Sleep Diary" = paste0("SLEEP DIARY (N = ", n_diary, ")"),
+                    "Actigraphy"  = paste0("ACTIGRAPHY (N = ", n_actig, ")"))
+  ) %>%
+  # Create a grouping structure manually
+  as_grouped_data(groups = c("Source", "Metric")) %>%
+  # IMPORTANT: Clean up the "Source" column so it only shows on the FIRST line of the section
+  mutate(Source = if_else(duplicated(Source) & !is.na(Source), NA_character_, Source))
+
+# 2. Build the Flextable
+master_table <- table_prep %>%
+  flextable() %>%
+  # Standardize header names
+  set_header_labels(Week = "Week", Mean_SD = "Mean (SD)", 
+                    Diff = "Diff adjusted", CI = "95% CI", d = "d") %>%
+  
+  # A. Format the MAIN Source Headers (Grey Rows)
+  bold(i = ~ !is.na(Source), bold = TRUE) %>%
+  bg(i = ~ !is.na(Source), bg = "#E6E6E6") %>%
+  
+  # B. Format the Metric Headers (Bold/Italic Variables)
+  bold(i = ~ is.na(Source) & !is.na(Metric), bold = TRUE) %>%
+  italic(i = ~ is.na(Source) & !is.na(Metric)) %>%
+  
+  # C. Remove the repeated column text and Indent
+  # This makes the "Metric" row and "Week" rows look distinct
+  compose(i = ~ !is.na(Metric) & is.na(Source), j = 1, 
+          value = as_paragraph(as_chunk(Metric))) %>%
+  compose(i = ~ is.na(Metric) & is.na(Source), j = 1, 
+          value = as_paragraph(as_chunk(Week))) %>%
+  padding(i = ~ is.na(Metric) & is.na(Source), j = 1, padding.left = 20) %>%
+  
+  # D. Style & Alignment
+  align(j = 2:5, align = "center", part = "all") %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  
+  # E. Final Cleanup: Hide the helper columns
+  colformat_char(j = c("Source", "Metric"), na_str = "")
+
+# Save the Word doc
+save_as_docx(master_table, path = file.path(out_dir, "Sleep_Diary_Actigraphy_Results_Table.docx"))
+master_table
+
+```
+
+
+
