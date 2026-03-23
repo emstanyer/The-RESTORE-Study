@@ -172,7 +172,7 @@ final_composite <- (p_overall + p_subset) / (p_bar + p_discomfort) +
 # 6. Save and Print
 print(final_composite)
 
-ggsave(here("Output/feasibility/feasibility_results.png"), 
+ggsave(here("Figures/feasibility/feasibility_results.png"), 
        final_composite, width = 10, height = 10, dpi = 300)
 ```
 

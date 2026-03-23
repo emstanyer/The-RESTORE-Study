@@ -1,0 +1,483 @@
+---
+title: 'PANAS Analysis'
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+params:
+  data_dir: Data/raw/PANAS
+  data_file: PANAS_data_raw.csv
+  out_dir: Output/PANAS
+  fig_dir: Figures/PANAS
+  clean_dir: Data/processed/PANAS
+---
+
+```{r setup, include=FALSE}
+# 1. Knitr Options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+# 2. Load Packages
+suppressPackageStartupMessages({
+  library(tidyverse)  # Loads dplyr, ggplot2, tidyr, readr, etc.
+  library(here)
+  library(fs)
+  library(knitr)
+  library(kableExtra)
+  library(writexl)
+  library(ggprism)
+})
+
+# 3. Define Absolute Paths
+data_path <- here::here(params$data_dir, params$data_file)
+out_dir   <- here::here(params$out_dir)
+fig_dir   <- here::here(params$fig_dir)
+
+# 4. Create Folders (fs::dir_create handles existence checks automatically)
+fs::dir_create(c(out_dir, fig_dir))
+```
+
+# Read in the PANAS data
+```{r, read-data, include =TRUE}
+data_path <- file.path(params$data_dir, params$data_file)
+
+# diagnostics 
+cat("Working directory:", getwd(), "\n")
+cat("Expecting data at:", data_path, "\n")
+if (dir.exists(params$data_dir)) {
+  cat("Files in", params$data_dir, ":\n"); print(list.files(params$data_dir, pattern = "\\.(csv|xlsx)$"))
+} else {
+  cat("Directory", params$data_dir, "does not exist relative to getwd().\n")
+}
+
+if (!file.exists(data_path)) stop("Data file not found: ", data_path)
+
+raw_panas <- read_csv(data_path, show_col_types = FALSE)
+cat("Read data: rows =", nrow(raw_panas), "cols =", ncol(raw_panas), "\n")
+
+
+```
+
+# Clean the PANAS data
+```{r, data-cleaning}
+# Create week_label, week, time_of_day, valence and week_group (BSL -> Baseline; SRT weeks 1-4)
+panas <- raw_panas %>%
+  mutate(
+    week_label = case_when(
+      day >= 1 & day <= 7 & timepoint == "BSL" ~ "BSL",
+      day >= 8 & day <= 14 & timepoint == "BSL" ~ "BSL",
+      day >= 1 & day <= 7 & timepoint == "SRT" ~ "1",
+      day >= 8 & day <= 14 & timepoint == "SRT" ~ "2",
+      day >= 15 & day <= 21 & timepoint == "SRT" ~ "3",
+      day >= 22 & day <= 28 & timepoint == "SRT" ~ "4",
+      TRUE ~ NA_character_
+    ),
+    week = cut(
+      day,
+      breaks = seq(0, max(day, na.rm = TRUE), by = 7),
+      labels = paste0("Week", seq_len(length(seq(0, max(day, na.rm = TRUE), by = 7)) - 1)),
+      include.lowest = TRUE
+    ),
+    time_of_day = factor(time_of_day, levels = c("morning","evening"),
+                         labels = c("Morning","Evening")),
+    valence = factor(valence, levels = c("positive","negative"),
+                     labels = c("Positive","Negative"))
+  ) %>%
+  mutate(
+    week_group = case_when(
+      timepoint == "BSL" & week_label == "BSL" ~ "Baseline",
+      TRUE ~ as.character(week_label)
+    ),
+    week_group = factor(week_group, levels = c("Baseline","1","2","3","4"))
+  )
+
+# Save cleaned snapshot
+write_xlsx(panas, path = file.path(params$clean_dir, "panas_data_clean.xlsx"))
+
+cat("panas rows:", nrow(panas), "unique Record ID:", n_distinct(panas$`Record ID`), "\n")
+print(names(panas))
+
+```
+
+#  Calculate time gap between PANAS completion and bedtime/risetime
+```{r}
+
+library(tidyverse)
+library(lubridate)
+library(hms)
+
+# 1. Load the processed Diary data
+# This ensures diary_final is available in your PANAS script
+diary_path <- here::here("Data", "processed", "sleep_diary", "diary_data_clean.csv")
+
+if (!file.exists(diary_path)) {
+  stop("Processed diary file not found! Run the Sleep Diary script first.")
+}
+
+diary_final <- read_csv(diary_path, show_col_types = FALSE) %>%
+  mutate(
+    # Essential: Ensure ID is padded and Date is a Date object for the join
+    Id = str_pad(as.character(Id), width = 3, side = "left", pad = "0"),
+    Date = as.Date(Date)
+  )
+
+# 1. Standardize PANAS Data (Both Morning and Evening)
+panas_standardized <- raw_panas %>%
+  mutate(
+    Id = str_pad(as.character(`Record ID`), width = 3, side = "left", pad = "0"),
+    panas_comp_dt = dmy_hm(clock_time_completed),
+    match_date = as.Date(panas_comp_dt),
+    time_of_day = tolower(time_of_day)
+  ) %>%
+  distinct(Id, match_date, time_of_day, .keep_all = TRUE)
+
+# 2. Join with Diary Data
+adherence_joined <- panas_standardized %>%
+  inner_join(diary_final, by = c("Id", "match_date" = "Date")) %>%
+  mutate(
+    # Gap calculation based on time of day
+    gap_mins = case_when(
+      time_of_day == "evening" ~ as.numeric(difftime(bed_datetime, panas_comp_dt, units = "mins")),
+      time_of_day == "morning" ~ as.numeric(difftime(panas_comp_dt, rise_datetime, units = "mins")),
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  # Filter out negatives (completed after bed or before rising)
+  filter(!is.na(gap_mins), gap_mins >= 0)
+
+# 3. Final Summary Table
+adherence_summary <- adherence_joined %>%
+  group_by(time_of_day) %>%
+  summarise(
+    avg_gap_mins = mean(gap_mins, na.rm = TRUE),
+    sd_gap_mins  = sd(gap_mins, na.rm = TRUE),
+    n_obs        = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # Format for easy reading in the report
+    avg_hhmm = as_hms(round(avg_gap_mins * 60)),
+    sd_hhmm  = as_hms(round(sd_gap_mins * 60))
+  )
+
+# 4. Display results clearly
+knitr::kable(adherence_summary, 
+             caption = "Time Gap between PANAS Completion and Sleep Diary Timestamps",
+             col.names = c("Session", "Avg Mins", "SD Mins", "N", "Avg (HH:MM)", "SD (HH:MM)"))
+```
+
+# Weekly summaries
+```{r}
+panas_summary <-  panas %>%
+  group_by(valence, time_of_day, week_group) %>%
+  summarise(
+    n = n_distinct(`Record ID`),
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score = sd(score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(valence, time_of_day, week_group)
+
+panas_summary %>%
+  knitr::kable(digits = 2, caption = "Weekly PANAS descriptives: n, mean, SD") %>%
+  kable_styling(full_width = FALSE)
+
+```
+
+# Plot weekly PANAS scores
+```{r}
+## Plot weekly PANAS scores
+# prepare plotting summary with SE and enforce x-axis order
+panas_plot_week <- panas %>% # Changed from raw_panas to panas
+  mutate(
+    # Ensure week_clean is based on the already created week_label
+    week_clean = factor(week_label, levels = c("BSL", "1", "2", "3", "4"))
+  ) %>%
+  filter(!is.na(week_clean)) %>%
+  group_by(valence, time_of_day, week_clean) %>%
+  summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score = sd(score, na.rm = TRUE),
+    n = sum(!is.na(score)),
+    se_score = sd_score / sqrt(pmax(n, 1)),
+    .groups = "drop"
+  )
+
+# Define colors
+cols <- c("Positive" = "#00968a", "Negative" = "#c81f6e")
+
+# 4. Create the Plot
+p <- ggplot(panas_plot_week, aes(x = week_clean, y = mean_score, group = valence)) +
+  # Background shading for Evening facet
+  geom_rect(data = subset(panas_plot_week, time_of_day == "Evening"),
+            aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf),
+            fill = "grey95", inherit.aes = FALSE) +
+  geom_line(aes(color = valence), linewidth = 1) +
+  geom_errorbar(aes(ymin = mean_score - se_score, ymax = mean_score + se_score, color = valence),
+                width = 0.2, linewidth = 0.8) +
+  geom_point(aes(fill = valence, color = valence), shape = 16, size = 4) +
+  facet_wrap(~ time_of_day, nrow = 1) +
+  scale_fill_manual(values = cols) +
+  scale_color_manual(values = cols) +
+  # Adjusted limits to 30 to ensure error bars aren't cut off if data is high
+  scale_y_continuous(limits = c(10, 25), breaks = seq(10, 50, 5), expand = c(0,0)) +
+  labs(x = "Study Week", y = "PANAS Score", fill = "Valence", color = "Valence") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.line = element_line(colour = "black", linewidth = 0.8),
+    strip.text = element_text(face = "bold"), 
+    axis.title = element_text(face = "bold"),
+    legend.position = "top"
+  )
+
+print(p)
+
+# 5. Save plot to files (Figure 3)
+ggsave(
+  filename = file.path(fig_dir, "Figure 3.tiff"), 
+  plot = p, 
+  width = 6, 
+  height = 4.5, 
+  dpi = 300,
+  compression = "lzw" 
+)
+
+```
+
+# Plot across each day of the 1st week of SRT 
+```{r}
+# 1. Prepare Daily Plotting Summary
+panas_plot_daily <- panas %>%
+  mutate(
+    # Create the specific labels
+    day_label = case_when(
+      timepoint == "BSL" ~ "Baseline",
+      day == 28 | timepoint == "FU" ~ "Follow-up",
+      day >= 1 & day <= 7 ~ paste0("Day", day),
+      TRUE ~ NA_character_ # Filters out any other days
+    ),
+    # Set the levels to control the order on the X-axis
+    day_label = factor(day_label, levels = c(
+      "Baseline", 
+      paste0("Day", 1:7), 
+      "Follow-up"
+    )),
+    time_of_day = factor(time_of_day, levels = c("Morning", "Evening")),
+    valence = factor(valence, levels = c("Negative", "Positive"))
+  ) %>%
+  # Remove the NAs (days between 7 and 28)
+  filter(!is.na(day_label), !is.na(score)) %>%
+  group_by(valence, time_of_day, day_label) %>%
+  summarise(
+    mean_score = mean(score, na.rm = TRUE),
+    sd_score = sd(score, na.rm = TRUE),
+    n = n(),
+    se_score = sd_score / sqrt(pmax(n, 1)),
+    .groups = "drop"
+  )
+
+# 2. Colors & Plotting
+cols <- c("Positive" = "#00968a", "Negative" = "#c81f6e")
+
+p_daily <- ggplot(panas_plot_daily, aes(x = day_label, y = mean_score, color = valence, group = valence)) +
+  # Add Grey Background to Evening
+  geom_rect(data = subset(panas_plot_daily, time_of_day == "Evening"),
+            aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf),
+            fill = "grey90", inherit.aes = FALSE) +
+  
+  # Error bars, Lines, and Points
+  geom_errorbar(aes(ymin = mean_score - se_score, ymax = mean_score + se_score), 
+                width = 0.2, linewidth = 1) +
+  geom_line(linewidth = 1) +
+  # Using shape 21 for the black outline effect seen in your image
+  geom_point(size = 4, aes(fill = valence), shape = 21, color = "black", stroke = 0.5) +
+  
+  # Faceting
+  facet_wrap(~ time_of_day, nrow = 1) +
+  
+  # Scales & Formatting
+  scale_color_manual(values = cols) +
+  scale_fill_manual(values = cols) +
+  scale_y_continuous(limits = c(10, 25), breaks = seq(10, 25, 5)) +
+  
+  # Labels and Theme
+  labs(x = NULL, y = "PANAS Score") +
+  theme_bw() + 
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 1),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "top",
+    legend.title = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black", face = "bold"),
+    axis.title.y = element_text(face = "bold")
+  )
+
+# 3. Save as Figure S2
+ggsave(file.path(fig_dir, "Figure S2.jpg"), p_daily, width = 10, height = 7, dpi = 600)
+
+print(p_daily)
+```
+
+# Linear Mixed Model
+```{r}
+suppressPackageStartupMessages({
+  library(lme4)
+  library(emmeans)
+  library(writexl)
+})
+
+# Prepare phase_week variable (Baseline, Week1..Week4)
+panas_data_week <- panas %>%
+  mutate(
+    phase_week = case_when(
+      timepoint == "BSL" ~ "Baseline",
+      timepoint == "SRT" & week_group %in% c("1","2","3","4") ~ paste0("Week", week_group),
+      TRUE ~ NA_character_
+    ),
+    phase_week = factor(phase_week, levels = c("Baseline", paste0("Week",1:4)))
+  ) %>%
+  filter(!is.na(phase_week))
+
+# ensure ordering for final table
+panas_data_week$valence <- factor(panas_data_week$valence, 
+                                  levels = c("Positive", "Negative"))
+panas_data_week$time_of_day <- factor(panas_data_week$time_of_day, 
+                                      levels = c("Morning", "Evening"))
+
+# safe LMM runner: returns data.frame of contrasts or NULL
+run_lmm_by_week <- function(data_subset) {
+  data_subset <- data_subset %>% filter(!is.na(score))
+  if (n_distinct(data_subset$`Record ID`) < 2) return(NULL)
+  fit <- tryCatch(lmer(score ~ phase_week + (1 | `Record ID`), 
+                       data = data_subset, REML = TRUE),
+                  error = function(e) return(NULL))
+  if (is.null(fit)) return(NULL)
+  emms <- tryCatch(emmeans(fit, specs = "phase_week"), error = function(e) return(NULL))
+  if (is.null(emms)) return(NULL)
+  contr <- tryCatch(contrast(emms, method = "trt.vs.ctrl", ref = "Baseline") %>% 
+                      summary(infer = TRUE, adjust = "none"),
+                    error = function(e) return(NULL))
+  if (is.null(contr)) return(NULL)
+  sd_resid <- sigma(fit)
+  out <- as.data.frame(contr) %>%
+    mutate(
+      Cohens_d = estimate / sd_resid
+    )
+  return(out)
+}
+
+# loop across valence × time_of_day and collect results
+results_list <- list()
+for (v in levels(panas_data_week$valence)) {
+  for (t in levels(panas_data_week$time_of_day)) {
+    subset_data <- filter(panas_data_week, valence == v, time_of_day == t)
+    if (nrow(subset_data) > 0) {
+      res <- run_lmm_by_week(subset_data)
+      if (!is.null(res)) {
+        res$valence <- v
+        res$time_of_day <- t
+        results_list[[paste(v, t, sep = "_")]] <- res
+      }
+    }
+  }
+}
+
+# combine, format, order (Positive first, Morning first), drop p-value column
+if (length(results_list) > 0) {
+  panas_lmm_results_by_week <- bind_rows(results_list) %>%
+    # numeric columns (keep numeric estimate for downstream use)
+    mutate(
+      estimate = as.numeric(estimate),
+      lower.CL = as.numeric(lower.CL),
+      upper.CL = as.numeric(upper.CL),
+      CI_range = paste0(sprintf("%.2f", lower.CL), " to ", sprintf("%.2f", upper.CL)),
+      Cohens_d = round(as.numeric(Cohens_d), 2)
+    ) %>%
+    # enforce ordering columns and rows: Positive first, Morning first
+    mutate(
+      valence = factor(valence, levels = c("Positive", "Negative")),
+      time_of_day = factor(time_of_day, levels = c("Morning", "Evening"))
+    ) %>%
+    arrange(valence, time_of_day, contrast) %>%
+    select(valence, time_of_day, contrast, estimate, lower.CL, upper.CL, CI_range, Cohens_d)
+
+
+
+  # Print a clean table for the report (format numbers, no p-value)
+  panas_lmm_results_by_week %>%
+    mutate(
+      Estimate = sprintf("%.2f", estimate),
+      `Lower 95%` = sprintf("%.2f", lower.CL),
+      `Upper 95%` = sprintf("%.2f", upper.CL),
+      `95% CI` = CI_range,
+      `Cohen's d` = sprintf("%.2f", Cohens_d)
+    ) %>%
+    select(valence, time_of_day, contrast, Estimate, `95% CI`, `Cohen's d`) %>%
+  knitr::kable(digits = 2, 
+               caption = "LMM contrasts vs Baseline (adjusted difference and 95% CI)",
+               escape = TRUE)
+
+} else {
+  cat("No LMM results produced (check data / grouping).")
+}
+
+# Create and Save Professional Word Table
+
+library(flextable)
+library(officer)
+
+if (exists("panas_lmm_results_by_week") && nrow(panas_lmm_results_by_week) > 0) {
+  
+  # 1. Prepare data for flextable
+  table_df <- panas_lmm_results_by_week %>%
+    mutate(
+      estimate = sprintf("%.2f", estimate),
+      Cohens_d = sprintf("%.2f", Cohens_d)
+    ) %>%
+    select(valence, time_of_day, contrast, estimate, CI_range, Cohens_d) %>%
+    rename(
+      `Valence` = valence,
+      `Time of Day` = time_of_day,
+      `Contrast` = contrast,
+      `Estimate` = estimate,
+      `95% CI` = CI_range,
+      `Cohen's d` = Cohens_d
+    )
+
+  # 2. Build the flextable
+  ft <- flextable(table_df) %>%
+    # Merge vertical cells for cleaner look
+    merge_v(j = c("Valence", "Time of Day")) %>% 
+    # Formatting
+    theme_booktabs() %>% 
+    autofit() %>%
+    bold(part = "header") %>%
+    align(j = 4:6, align = "center", part = "all") %>%
+    set_caption("Linear Mixed Model: Contrasts vs Baseline for PANAS Scores") %>%
+    # Fix border lines after merging
+    fix_border_issues()
+
+  # 3. Save as Word Doc
+  save_as_docx(ft, path = file.path(out_dir, "PANAS_LMM_Results_Table.docx"))
+  
+  # Preview in the report
+  ft
+} else {
+  message("No results available to export.")
+}
+
+```
+
+
+
+
