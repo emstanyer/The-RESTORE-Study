@@ -1,0 +1,941 @@
+---
+title: "EEG Sleep Analysis"
+author: "Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+params:
+  # ---- INPUTS ----
+  profile_dir: "Data/raw/EEG/sleep_profile/"         # folder of nightly EEG profile .xlsx files
+  blinding_file: "Data/raw/EEG/blinding_files/blinding.xlsx"   # has ParticipantID, Timepoint, Original_filename, Real_ID (if available)
+  notes_file:    "Data/raw/EEG/scoring_notes/Scoring_Notes_Final_110725.xlsx" # has ParticipantID, artefact_percentage, scoreability, impedances
+  
+  # ---- OUTPUTS ----
+  proc_dir: "Data/processed/EEG"
+  fig_dir: "Figures/EEG"
+  out_dir: "Output/EEG"
+  apply_artifact_filter: false   # set true to drop nights with artefact % > threshold
+  artifact_threshold: 10         # percent
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 4.8)
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(stringr)
+  library(ggplot2)
+  library(ggprism)
+  library(writexl)
+  library(knitr)
+  library(kableExtra)
+  library(sessioninfo)
+  library(lme4)
+  library(emmeans)
+  library(purrr)
+})
+
+# ---- paths ----
+out_dir <- params$out_dir
+fig_dir <- params$fig_dir
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+set.seed(2025)
+```
+
+# Read and combine raw EEG profile files
+```{r 1-read-eeg}
+# Helper: deduplicate readxl-style column suffixes like NAME...1, NAME...2 (keep first)
+library(here)
+dedup_cols <- function(df){
+  base <- gsub("\\.{3}\\d+$", "", names(df))
+  keep <- !duplicated(base)
+  names(df) <- base
+  df[, keep, drop = FALSE]
+}
+
+# Helper: safer numeric coercion from character
+numify <- function(x){ suppressWarnings(as.numeric(x)) }
+
+# 1) List files
+# Instead of a hardcoded string, use:
+profile_dir <- here::here(params$profile_dir)
+stopifnot(dir.exists(profile_dir))
+file_list <- list.files(profile_dir, pattern = "\\.xlsx$", full.names = TRUE)
+cat("Found", length(file_list), "profile files in", profile_dir, "\n")
+if(length(file_list) == 0) stop("No .xlsx files found in ", profile_dir)
+
+# 2) Read each file (skip=1 to match your export), tag ParticipantID from filename (digits before first underscore)
+raw_list <- map(file_list, \(pth){
+  df <- readxl::read_excel(pth, skip = 1, col_types = "text")
+  df$ParticipantID <- stringr::str_extract(basename(pth), "^\\d+")
+  dedup_cols(df)
+})
+
+raw <- bind_rows(raw_list)
+cat("Combined rows:", nrow(raw), " Cols:", ncol(raw), "\n")
+```
+
+# Join blinding & artefact/notes; derive day/date/Real_ID
+```{r 2-join-blinding-notes}
+# --- 1. Define missing helper function ---
+load_external <- function(path) {
+  # Use here::here() to ensure path is absolute relative to project root
+  abs_path <- here::here(path)
+  if(!file.exists(abs_path)) stop("External file not found at: ", abs_path)
+  
+  readxl::read_xlsx(abs_path) %>%
+    dplyr::mutate(ParticipantID = trimws(as.character(ParticipantID)))
+}
+
+# --- 2. Load Blinding and Notes ---
+blinding <- load_external(params$blinding_file)
+notes    <- load_external(params$notes_file)
+
+expected_cols <- c(
+  "ParticipantID", "Timepoint", "Day",
+  # Durations
+  "TIB_DURATION", "SLEEP_DURATION", "WAKE_DURATION", "NONREM_DURATION", 
+  "STAGE1_DURATION", "STAGE2_DURATION", "STAGE3_DURATION", "STAGE4_DURATION", 
+  "REM_DURATION", "WAKE_AFTER_SLEEP_ON", "MOVEMENT_DURATION", 
+  # Percentages
+  "WAKE_PERCENTAGE", "REM_PERCENTAGE", "NONREM_PERCENTAGE", "SLEEP_EFFICIENCY",
+  "STAGE1_PERCENTAGE", "STAGE2_PERCENTAGE", "STAGE3_PERCENTAGE", "DEEPSLEEP_PERCENTAGE",
+  # Latencies
+  "SLEEPLATENCY", "REM_LATENCY", "SLEEPLATENCY_DEEPSLEEP", "SLEEPLATENCY_LPS",
+  # Other Metrics
+  "FIRST_REM", "STAGE_CHANGE_NUMBER", "WAKE_NUMBER", "ARTEFACT_PERCENTAGE",
+  "REM_DENSITY", "SLEEP_PROFILE_MANUALLY_SCORED"
+)
+
+# --- 3. Join and Derive ---
+
+merged <- raw %>%
+  dplyr::mutate(ParticipantID = trimws(as.character(ParticipantID))) %>%
+  # Ensure expected_cols contains all the software headers we discussed!
+  dplyr::select(dplyr::any_of(c(expected_cols, "ParticipantID", "Original_filename", "Timepoint"))) %>%
+  dplyr::left_join(blinding, by = "ParticipantID", suffix = c("", ".bl")) %>%
+  dplyr::left_join(notes %>% dplyr::select(ParticipantID, dplyr::any_of(c("artefact_percentage", "scoreability"))), 
+                   by = "ParticipantID") %>%
+  dplyr::mutate(
+    # 1. Handle filename and ID derivation
+    Original_filename = dplyr::coalesce(
+      !!!rlang::syms(intersect(names(.), c("Original_filename", "Original_filename.x", "Original_filename.bl"))),
+      ParticipantID
+    ),
+    Real_ID = dplyr::coalesce(
+      !!!rlang::syms(intersect(names(.), c("Real_ID", "Real_ID.bl", "Real_ID.y"))),
+      stringr::str_extract(Original_filename, "(?<=REST_)\\d{3}"),
+      ParticipantID
+    ),
+    
+    # 2. Extract Date
+    date_str = stringr::str_extract(Original_filename, "\\d{8}"),
+    date = suppressWarnings(lubridate::dmy(date_str)),
+    
+    # 3. IMPROVED Day Extraction (Fixes the NA issue)
+    # This looks for 'N' or 'NIGHT' followed by the number
+    day_num = stringr::str_extract(Original_filename, "(?i)(?<=NIGHT|N|N_)\\d+"),
+    
+    day = dplyr::case_when(
+      stringr::str_detect(Original_filename, "(?i)BSL|Baseline") ~ "BSL",
+      stringr::str_detect(Original_filename, "(?i)FU|Follow")   ~ "FU",
+      !is.na(day_num) ~ as.character(day_num), # Maps 'N1' to '1', 'N2' to '2', etc.
+      TRUE ~ as.character(Timepoint)           # Fallback to Timepoint column
+    )
+  ) %>%
+  dplyr::select(-dplyr::any_of(c("Original_filename.x","Original_filename.y","Original_filename.bl",
+                                "Real_ID.x","Real_ID.y","Real_ID.bl", "date_str", "day_num")))
+```
+
+# Clean the data
+```{r 3-clean-transform, message=FALSE, warning=FALSE}
+# 1. Settings
+day_levels <- c("BSL","1","2","3","4","5","6","7","FU")
+
+# Heuristic unit converter: day-fraction -> minutes; hours -> minutes; else assume minutes
+convert_to_minutes <- function(x){
+  x <- numify(x)
+  if (all(is.na(x))) return(x)
+  xp <- x[!is.na(x)]
+  if (length(xp) > 0 && max(xp, na.rm = TRUE) <= 1.1) {
+    x * 24 * 60
+  } else if (length(xp) > 0 && stats::median(xp, na.rm = TRUE) <= 20) {
+    x * 60
+  } else x
+}
+# Columns that represent durations (will be converted to minutes)
+duration_vars <- c(
+  "TIB_DURATION","SLEEP_DURATION","WAKE_DURATION","REM_DURATION","NONREM_DURATION",
+  "REM_LATENCY","SLEEPLATENCY","SLEEPLATENCY_NONREM","WAKE_AFTER_SLEEP_ON",
+  "STAGE1_DURATION","STAGE2_DURATION","STAGE3_DURATION","STAGE4_DURATION",
+  "SLEEPLATENCY_DEEPSLEEP","SLEEPLATENCY_LPS","MOVEMENT_DURATION",
+  "MOVEMENT_DURATION_SPT","WAKE_DURATION_SPT","REM_DURATION_SPT",
+  "STAGE1_DURATION_SPT","STAGE2_DURATION_SPT","STAGE3_DURATION_SPT","STAGE4_DURATION_SPT",
+  "ARTEFACT_DURATION_SPT","FIRST_REM","REM_LATENCY_MSLT","REM_LATENCY_MWT"
+)
+
+# 2. Clean the raw column names
+# Removes Excel suffixes like "...15" and trims hidden spaces
+names(merged) <- trimws(gsub("\\.{3}\\d+$", "", names(merged)))
+
+# 3. Define the Rename Map (NEW NAME = OLD SOFTWARE NAME)
+rename_map <- c(
+  "Wake (mins)"          = "WAKE_DURATION",
+  "REM (mins)"           = "REM_DURATION",
+  "N1 (mins)"            = "STAGE1_DURATION",
+  "N2 (mins)"            = "STAGE2_DURATION",
+  "N3 (mins)"            = "STAGE3_DURATION",
+  "Wake (%)"             = "WAKE_PERCENTAGE",
+  "REM (%)"              = "REM_PERCENTAGE",
+  "N1 (%)"               = "STAGE1_PERCENTAGE",
+  "N2 (%)"               = "STAGE2_PERCENTAGE",
+  "N3 (%)"               = "STAGE3_PERCENTAGE",
+  "WASO (mins)"          = "WAKE_AFTER_SLEEP_ON",
+  "REM Latency (mins)"   = "REM_LATENCY",
+  "SOL (mins)"           = "SLEEPLATENCY",
+  "TIB (mins)"           = "TIB_DURATION",
+  "TST (mins)"           = "SLEEP_DURATION",
+  "Sleep Efficiency (%)" = "SLEEP_EFFICIENCY",
+  "N3 Latency (mins)"    = "SLEEPLATENCY_DEEPSLEEP",
+ "Sleep Stage Transitions" = "STAGE_CHANGE_NUMBER",
+ "Transitions to Wake" = "WAKE_NUMBER")
+
+# 4. Build the 'clean' dataframe
+clean <- merged %>%
+  # Convert durations (using the helper function defined earlier)
+  dplyr::mutate(dplyr::across(dplyr::any_of(duration_vars), convert_to_minutes)) %>%
+  # Apply the renaming map
+  dplyr::rename(dplyr::any_of(rename_map)) %>%
+  # Ensure correct data types and factors
+  dplyr::mutate(
+    Real_ID = as.character(Real_ID),
+    day     = factor(day, levels = day_levels),
+    # Ensure these are numeric even if Excel had them as text
+    artefact_percentage = suppressWarnings(as.numeric(as.character(artefact_percentage))),
+    scoreability        = suppressWarnings(as.numeric(as.character(scoreability)))
+  )
+
+# --- NOTE: Participant and Artefact filtering removed per request ---
+final_output_path <- here::here("Data", "processed", "EEG")
+# 5. Final Export of the Wide Table
+writexl::write_xlsx(clean, file.path(final_output_path, "clean_EEG_data.xlsx"))
+
+# --- DIAGNOSTICS ---
+cat("--- Data Clean Check ---\n")
+cat("Total rows kept:", nrow(clean), "\n")
+cat("Total participants:", dplyr::n_distinct(clean$Real_ID), "\n")
+cat("Columns renamed successfully:", sum(names(rename_map) %in% names(clean)), "out of", length(rename_map), "\n")
+
+if(any(!names(rename_map) %in% names(clean))) {
+  cat("Missing from raw data:", paste(names(rename_map)[!names(rename_map) %in% names(clean)], collapse=", "), "\n")
+}
+```
+
+
+# Long data + exports
+```{r 4-long-data}
+# 1. Define the variables we want to keep for analysis/plotting
+# (Must match the NEW names from Chunk 3 exactly)
+
+needed_vars <- c(
+  "TIB (mins)", "TST (mins)", "Wake (mins)", "Wake (%)",
+  "REM (mins)", "REM (%)", "N1 (mins)", "N1 (%)", 
+  "N2 (mins)", "N2 (%)", "N3 (mins)", "N3 (%)",
+  "WASO (mins)", "REM Latency (mins)", "SOL (mins)", 
+  "Sleep Efficiency (%)", "N3 Latency (mins)",
+  "Sleep Stage Transitions", "Transitions to Wake", # Added these
+  "artefact_percentage"
+)
+
+# 2. Pivot to Long Format
+EEG_long <- clean %>%
+  # Select ID, Day, and only the columns in our 'needed_vars' list
+  dplyr::select(Real_ID, day, dplyr::any_of(needed_vars)) %>%
+  
+  # Ensure all value columns are numeric before pivoting 
+  # (Prevents "Can't combine double and character" errors)
+  dplyr::mutate(dplyr::across(-c(Real_ID, day), ~suppressWarnings(as.numeric(as.character(.x))))) %>%
+  
+  # Transform from Wide to Long
+  tidyr::pivot_longer(
+    cols = -c(Real_ID, day), 
+    names_to = "variable", 
+    values_to = "value"
+  ) %>%
+  # Remove any rows where the value is NA (optional, helps keep the file small)
+  dplyr::filter(!is.na(value))
+
+# 3. Export to Excel
+# --- NOTE: Participant and Artefact filtering removed per request ---
+final_output_path <- here::here("Data", "processed", "EEG")
+# 5. Final Export of the Wide Table
+writexl::write_xlsx(clean, file.path(final_output_path, "EEG_data_long_clean.xlsx"))
+
+# --- DIAGNOSTICS ---
+cat("--- Long Data Check ---\n")
+cat("Total rows in long format:", nrow(EEG_long), "\n")
+cat("Variables found and pivoted:\n")
+print(unique(EEG_long$variable))
+
+# Quick Peek at the first few rows
+head(EEG_long)
+```
+
+# Summary statistics (Mean, SD, CI) and wide tables
+```{r summaries}
+# SAFETY CHECK: If EEG_long doesn't exist or is empty, stop and warn
+if (!exists("EEG_long") || nrow(EEG_long) == 0) {
+  stop("EEG_long is missing or empty. Please run the 'long-data' chunk first.")
+}
+
+# 1) Calculate Statistics
+sum_long <- EEG_long %>%
+  # Filter out rows where value is NA to avoid math errors
+  filter(!is.na(value)) %>%
+  group_by(variable, day) %>%
+  summarise(
+    n = n(),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    se = sd / sqrt(pmax(n, 1)),
+    tcrit = qt(0.975, df = pmax(n-1, 1)),
+    ci_low = mean - tcrit * se,
+    ci_high = mean + tcrit * se,
+    .groups = "drop"
+  ) %>%
+  # Format into strings for the table
+  mutate(
+    `Mean (SD)` = sprintf("%.2f (%.2f)", mean, sd), 
+    CI = paste0(sprintf("%.2f", ci_low), "–", sprintf("%.2f", ci_high))
+  )
+
+# 2) Create Wide Tables
+# Table 1: Mean (SD)
+mean_sd_wide <- sum_long %>%
+  select(variable, day, `Mean (SD)`) %>%
+  pivot_wider(names_from = day, values_from = `Mean (SD)`) %>%
+  arrange(variable)
+
+# Table 2: N (Sample Size)
+n_wide <- sum_long %>% 
+  select(variable, day, n) %>% 
+  pivot_wider(names_from = day, values_from = n) %>% 
+  arrange(variable)
+
+output_path <- here::here("Output", "EEG")
+
+
+# 4) Display in the Report
+cap <- "EEG Mean (SD) by Day (Rows = Variables; Columns = BSL, 1–7, FU)"
+knitr::kable(mean_sd_wide, caption = cap) %>%
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+# Plots (overall and minutes-only)
+```{r plots, fig.width=11, fig.height=9}
+library(ggprism)
+
+# 1. Prepare data for plotting
+plot_df <- EEG_long %>%
+  group_by(day, variable) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE), 
+    sd = sd(value, na.rm = TRUE), 
+    n = sum(!is.na(value)),
+    se = sd / sqrt(pmax(n, 1)), 
+    .groups = "drop"
+  )
+
+# 2. Define the selection (Minutes + Sleep Efficiency)
+# Adding "Sleep Efficiency (%)" to your list
+mins_plus_se <- c(
+  "TIB (mins)", "TST (mins)", "Sleep Efficiency (%)", 
+  "WASO (mins)", "SOL (mins)", "REM Latency (mins)", 
+  "N3 Latency (mins)", "N1 (mins)", "N2 (mins)", 
+  "N3 (mins)", "REM (mins)"
+)
+
+# 3. Filter and set factor levels for stable plotting order
+plot_filtered <- plot_df %>% 
+  dplyr::filter(variable %in% mins_plus_se) %>%
+  dplyr::mutate(variable = factor(variable, levels = mins_plus_se))
+
+# 4. Generate the Plot (Fixed Theme Order)
+p_eeg <- ggplot(plot_filtered, aes(x = day, y = mean, group = 1)) +
+  geom_point(size = 3, shape = 17, color = "#0091d4") +
+  geom_line(linewidth = 1, color = "#0091d4") +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, color = "#0091d4") +
+  
+  # 1. Faceting
+  facet_wrap(~ variable, scales = "free_y", ncol = 3) + 
+  
+  
+  # 3. Custom Overrides (Must come AFTER theme_prism)
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 9),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  ) +
+  
+  # 4. Labels
+  labs(
+    x = "Study Night", 
+    y = "Mean ± SE",
+  )
+# 4. Generate the Plot (Clean Publication Style)
+p_eeg <- ggplot(plot_filtered, aes(x = day, y = mean, group = 1)) +
+  # Geoms
+  geom_line(linewidth = 1, color = "#0091d4") +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, color = "#0091d4") +
+  geom_point(size = 3, shape = 17, color = "#0091d4") +
+  
+  # Faceting - "free_y" allows each metric to have its own scale
+  facet_wrap(~ variable, scales = "free_y", ncol = 3, axes = "all") + 
+  
+  # --- MANUAL CLEAN THEME ---
+  theme_classic() + # Removes grid and gray background automatically
+  theme(
+    # 1. Force Black Axis Lines (Prism Style)
+    axis.line = element_line(colour = "black", linewidth = 0.8),
+    axis.ticks = element_line(colour = "black", linewidth = 0.8),
+    
+    # 2. Format Text
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(face = "bold", size = 11),
+    
+    # 3. Clean Facet Labels (No gray boxes)
+    strip.background = element_blank(),
+    strip.text = element_text(size = 10, face = "bold"),
+    
+    # 4. Final Polish
+    legend.position = "none",
+    panel.spacing = unit(1, "lines") # Adds a bit of air between plots
+  ) +
+  # --- END THEME ---
+  
+  labs(
+    x = "Study Night", 
+    y = "Mean ± SE"
+  )
+
+# Display
+print(p_eeg)
+
+
+fig_dir <- here::here("Figures", "EEG")
+
+# Create the folder if it doesn't exist
+if (!dir.exists(fig_dir)) {
+  dir.create(fig_dir, recursive = TRUE)
+}
+
+# Save the high-res TIFF
+ggsave(file.path(fig_dir, "Figure 4.tiff"), p_eeg, width = 10, height = 7, dpi = 300, compression = "lzw")
+
+cat("Plot successfully saved to:", file.path(fig_dir, "Figure_4.tiff"))
+# 5. Save Exports
+ggsave(file.path(fig_dir, "Figure 4.jpg"), p_eeg, width = 10, height = 7, dpi = 300)
+```
+  # LMM function
+```{r}
+run_eeg_lmm <- function(df_long, varname) {
+  # 1. Prepare subset and ensure Value is numeric
+  df_sub <- df_long %>%
+    filter(variable == varname) %>%
+    mutate(
+      day = factor(day),
+      value = as.numeric(as.character(value))
+    ) %>%
+    filter(!is.na(value))
+  
+  # 2. Check levels
+  levels_present <- unique(as.character(df_sub$day))
+  if (!("BSL" %in% levels_present) | length(levels_present) < 2) return(NULL)
+  
+  # 3. Fit Model
+  fit <- tryCatch({
+    lmer(value ~ day + (1 | Real_ID), data = df_sub, REML = TRUE)
+  }, error = function(e) return(NULL))
+  
+  if (is.null(fit)) return(NULL)
+  
+  # 4. emmeans
+  em <- emmeans(fit, "day")
+  ct <- contrast(em, method = "trt.vs.ctrl", ref = "BSL") %>% 
+        summary(infer = TRUE) %>% 
+        as.data.frame()
+  
+  # 5. Calculate Cohen's d (Safety update here)
+  # Pivot and ensure columns are numeric for the subtraction
+  wide_data <- df_sub %>% 
+    select(Real_ID, day, value) %>% 
+    pivot_wider(names_from = day, values_from = value) %>%
+    mutate(across(-Real_ID, ~as.numeric(as.character(.x)))) # FORCE NUMERIC
+  
+  days_to_compare <- setdiff(levels_present, "BSL")
+  
+  d_results <- map_dfr(days_to_compare, function(d_val) {
+    # Check if both columns exist and are numeric
+    if ("BSL" %in% names(wide_data) && d_val %in% names(wide_data)) {
+      # Use na.rm = TRUE to handle missing values within the pair
+      diffs <- wide_data[[d_val]] - wide_data$BSL
+      mean_diff <- mean(diffs, na.rm = TRUE)
+      sd_diff   <- sd(diffs, na.rm = TRUE)
+      
+      cohens_d <- if(!is.na(sd_diff) && sd_diff != 0) mean_diff / sd_diff else NA
+      return(tibble(contrast = paste0(d_val, " - BSL"), Cohens_d = cohens_d))
+    }
+    return(NULL)
+  })
+  
+  # 6. Combine
+  res <- ct %>%
+    left_join(d_results, by = "contrast") %>%
+    mutate(variable = varname)
+  
+  return(res)
+}
+```
+
+
+# Linear mixed models (contrasts vs BSL) with within-person d
+```{r}
+suppressPackageStartupMessages({
+  library(flextable)
+  library(officer)
+  library(dplyr)
+  library(tidyr)
+})
+
+# 1. Prepare Data
+word_table_df <- sum_long %>%
+  filter(variable %in% target_vars) %>%
+  mutate(contrast = paste0(day, " - BSL")) %>%
+  left_join(EEG_effects, by = c("variable", "contrast")) %>%
+  mutate(
+    LCL = dplyr::coalesce(!!!rlang::syms(intersect(names(.), c("lower.CL", "asymp.LCL")))),
+    UCL = dplyr::coalesce(!!!rlang::syms(intersect(names(.), c("upper.CL", "asymp.UCL"))))
+  ) %>%
+  mutate(variable = factor(variable, levels = target_vars)) %>%
+  arrange(variable, day) %>%
+  mutate(
+    `Mean (SD)` = sprintf("%.2f (%.2f)", mean, sd),
+    `Diffadj` = ifelse(day == "BSL", "-", sprintf("%.2f", estimate)),
+    `95% CI` = ifelse(day == "BSL" | is.na(LCL), "-", 
+                      paste0(sprintf("%.2f", LCL), " to ", sprintf("%.2f", UCL))),
+    `d` = ifelse(day == "BSL" | is.na(Cohens_d), "-", sprintf("%.2f", Cohens_d)),
+    Day_Label = dplyr::case_when(
+      day == "BSL" ~ "Baseline",
+      day == "FU"  ~ "Follow up",
+      TRUE ~ paste("Night", day)
+    )
+  ) %>%
+  select(variable, Day_Label, `Mean (SD)`, `Diffadj`, `95% CI`, `d`)
+
+# 2. Convert to Grouped Data
+grouped_data <- as_grouped_data(x = word_table_df, groups = c("variable"))
+
+# Calculate group IDs for shading (ignoring the header rows)
+grouped_data <- grouped_data %>%
+  mutate(
+    temp_var = if_else(!is.na(variable), as.character(variable), NA_character_)
+  ) %>%
+  fill(temp_var, .direction = "down") %>%
+  mutate(group_num = as.numeric(factor(temp_var, levels = target_vars)))
+
+# 3. Create Flextable
+ft <- flextable(grouped_data, col_keys = c("variable", "Day_Label", "Mean (SD)", "Diffadj", "95% CI", "d")) %>%
+  # Header labels
+  set_header_labels(
+    variable = "EEG (n = 17)",
+    Day_Label = "",
+    `Mean (SD)` = "Mean (SD)",
+    Diffadj = "Diffadj",
+    `95% CI` = "95% CI",
+    d = "d"
+  ) %>%
+  # Remove Italics
+  italic(italic = FALSE, part = "all") %>%
+  # Bold variable headers
+  bold(i = ~ !is.na(variable), j = 1, bold = TRUE) %>%
+  # Apply Shading (even groups get grey)
+  bg(i = ~ group_num %% 2 == 0, bg = "#F2F2F2", part = "body") %>%
+  # FIX: Hide the variable names in data rows using compose
+  compose(i = ~ is.na(variable), j = "variable", value = as_paragraph("")) %>%
+  # Styling
+  fontsize(size = 10, part = "all") %>%
+  align(align = "left", part = "all") %>%
+  autofit() %>%
+  # Borders
+  border_remove() %>%
+  hline_top(border = fp_border(width = 1.5), part = "header") %>%
+  hline(i = 1, border = fp_border(width = 1.5), part = "header") %>%
+  # Footer
+  add_footer_lines("95% CI, 95% confidence interval of the mean difference; Diffadj, mean difference adjusted for missing values derived from linear mixed model; d, effect size (Cohen’s d); SD, standard deviation.") %>%
+  hline_bottom(border = fp_border(width = 1.5), part = "footer")
+
+# 4. Export
+doc <- read_docx() %>%
+  body_add_flextable(ft)
+
+word_out <- here::here("Output", "EEG", "EEG_LMM_results.docx")
+print(doc, target = word_out)
+
+cat("Success! Table saved to:", word_out)
+```
+
+
+# LMM for relative sleep stages for supplementary
+```{r}
+# --- 1. Define Percentage Variables ---
+target_perc_vars <- c("N1 (%)", "N2 (%)", "N3 (%)", "REM (%)")
+
+# --- 2. Run the LMM Logic for Percentages ---
+res_list_perc <- lapply(target_perc_vars, \(v) if(v %in% unique(EEG_long$variable)) run_eeg_lmm(EEG_long, v) else NULL)
+EEG_effects_perc <- dplyr::bind_rows(purrr::compact(res_list_perc))
+
+# --- 3. Join and Format Data ---
+final_perc_table_df <- sum_long %>%
+  filter(variable %in% target_perc_vars) %>%
+  mutate(contrast = paste0(day, " - BSL")) %>%
+  left_join(EEG_effects_perc, by = c("variable", "contrast")) %>%
+  # Fix for emmeans column naming
+  mutate(
+    LCL = dplyr::coalesce(!!!rlang::syms(intersect(names(.), c("lower.CL", "asymp.LCL")))),
+    UCL = dplyr::coalesce(!!!rlang::syms(intersect(names(.), c("upper.CL", "asymp.UCL"))))
+  ) %>%
+  mutate(variable = factor(variable, levels = target_perc_vars)) %>%
+  arrange(variable, day) %>%
+  mutate(
+    `Mean (SD)` = sprintf("%.2f (%.2f)", mean, sd),
+    `Diffadj` = ifelse(day == "BSL", "-", sprintf("%.2f", estimate)),
+    `95% CI` = ifelse(day == "BSL" | is.na(LCL), "-", 
+                      paste0(sprintf("%.2f", LCL), " to ", sprintf("%.2f", UCL))),
+    `d` = ifelse(day == "BSL" | is.na(Cohens_d), "-", sprintf("%.2f", Cohens_d)),
+    Day_Label = dplyr::case_when(
+      day == "BSL" ~ "Baseline",
+      day == "FU"  ~ "Follow up",
+      TRUE ~ paste("Night", day)
+    )
+  ) %>%
+  select(variable, Day_Label, `Mean (SD)`, `Diffadj`, `95% CI`, `d`)
+
+# --- 4. Create the Formatted Word Table ---
+grouped_perc_data <- as_grouped_data(x = final_perc_table_df, groups = c("variable"))
+
+# Shading logic
+grouped_perc_data <- grouped_perc_data %>%
+  mutate(temp_var = if_else(!is.na(variable), as.character(variable), NA_character_)) %>%
+  fill(temp_var, .direction = "down") %>%
+  mutate(group_num = as.numeric(factor(temp_var, levels = target_perc_vars)))
+
+ft_perc <- flextable(grouped_perc_data, col_keys = c("variable", "Day_Label", "Mean (SD)", "Diffadj", "95% CI", "d")) %>%
+  set_header_labels(variable = "EEG % (n = 17)", Day_Label = "", `Mean (SD)` = "Mean (SD)",
+                    Diffadj = "Diffadj", `95% CI` = "95% CI", d = "d") %>%
+  italic(italic = FALSE, part = "all") %>%
+  bold(i = ~ !is.na(variable), j = 1, bold = TRUE) %>%
+  bg(i = ~ group_num %% 2 == 0, bg = "#F2F2F2", part = "body") %>%
+  compose(i = ~ is.na(variable), j = "variable", value = as_paragraph("")) %>%
+  fontsize(size = 10, part = "all") %>%
+  align(align = "left", part = "all") %>%
+  autofit() %>%
+  border_remove() %>%
+  hline_top(border = fp_border(width = 1.5), part = "header") %>%
+  hline(i = 1, border = fp_border(width = 1.5), part = "header") %>%
+  add_footer_lines("95% CI, 95% confidence interval; Diffadj, mean difference adjusted via LMM; d, Cohen’s d; SD, standard deviation.") %>%
+  hline_bottom(border = fp_border(width = 1.5), part = "footer")
+
+# --- 5. Export ---
+doc_perc <- read_docx() %>% body_add_flextable(ft_perc)
+word_perc_out <- here::here("Output", "EEG", "EEG_LMM_Results_Proportions_supplementary.docx")
+print(doc_perc, target = word_perc_out)
+
+cat("Percentage results saved to Word:", word_perc_out)
+```
+
+# Create forest plots to show effect sizes
+```{r, fig.width=6, fig.height=9}
+library(dplyr)
+library(stringr)
+library(ggplot2)
+
+# 1. Define the chronological order for the Y-axis (Top to Bottom)
+night_levels <- c("1", "2", "3", "4", "5", "6", "7", "FU")
+night_labels <- c("Night 1", "Night 2", "Night 3", "Night 4", "Night 5", "Night 6", "Night 7", "Follow up")
+
+# 2. Prepare the data
+plot_data_final <- EEG_effects %>%
+  # Filter out any rows where LMM didn't run
+  filter(!is.na(estimate)) %>%
+  mutate(
+    # FIX: Create the 'day' column by extracting word/number before the dash
+    # This turns "1 - BSL" into "1" and "FU - BSL" into "FU"
+    extracted_day = str_extract(contrast, "^[^ ]+"),
+    
+    # Now create the Day_Label factor for the Y-axis
+    Day_Label = factor(extracted_day, 
+                       levels = rev(night_levels), 
+                       labels = rev(night_labels)),
+    
+    # Ensure math columns are numeric
+    estimate = as.numeric(as.character(estimate)),
+    low = as.numeric(lower.CL), 
+    high = as.numeric(upper.CL),
+    abs_d = abs(as.numeric(as.character(Cohens_d))),
+    
+    # Cohen's d sizing bins
+    d_size = case_when(
+      abs_d < 0.2 ~ "Negligible (< 0.2)",
+      abs_d >= 0.2 & abs_d < 0.5 ~ "Small (0.2)",
+      abs_d >= 0.5 & abs_d < 0.8 ~ "Medium (0.5)",
+      abs_d >= 0.8 ~ "Large (0.8)",
+      TRUE ~ "Small (0.2)"
+    ),
+    d_size = factor(d_size, levels = c("Negligible (< 0.2)", "Small (0.2)", "Medium (0.5)", "Large (0.8)"))
+  ) %>%
+  filter(!is.na(Day_Label)) # Drops anything that didn't match our 1-7/FU list
+
+# 3. Split into your two requested groups
+df_summary_plot <- plot_data_final %>% 
+  filter(variable %in% c("TST (mins)", "TIB (mins)", "WASO (mins)", "SOL (mins)", "Sleep Efficiency (%)"))
+
+df_stages_plot  <- plot_data_final %>% 
+  filter(variable %in% c("N1 (mins)", "N2 (mins)", "N3 (mins)", "REM (mins)")) 
+
+library(ggplot2)
+
+make_final_eeg_plot <- function(data_subset, plot_title, theme_color) {
+  
+  # 1. Symmetric limits for the 0-anchor
+  limit_val <- max(abs(c(data_subset$low, data_subset$high)), na.rm = TRUE) * 1.1
+  if(is.infinite(limit_val) || is.na(limit_val)) limit_val <- 10 
+  
+  ggplot(data_subset, aes(x = estimate, y = Day_Label)) +
+    # Reference line at zero
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray70") +
+    
+    # Error bars matching theme_color
+    geom_errorbarh(aes(xmin = low, xmax = high), 
+                   height = 0.3, linewidth = 0.8, color = theme_color, alpha = 0.5) + 
+    
+    # Blobs (Points) sized by Cohen's d
+    geom_point(aes(size = d_size), color = theme_color) +
+    
+    # Separate plots for each metric
+    facet_wrap(~variable, scales = "free_x", ncol = 2) +
+    expand_limits(x = c(-limit_val, limit_val)) +
+    
+    # Define the "Blob" sizes based on Cohen's conventions
+    scale_size_manual(values = c(
+      "Negligible (< 0.2)" = 1.5, 
+      "Small (0.2)" = 3, 
+      "Medium (0.5)" = 5, 
+      "Large (0.8)" = 8
+    )) +
+    
+    labs(
+      title = plot_title,
+      subtitle = "(n = 17)",
+      x = "Adjusted Mean Difference (95% CI)", 
+      y = NULL, 
+      size = "Effect Size (d)"
+    ) +
+    theme_minimal() +
+    theme(
+      strip.text = element_text(face = "bold", size = 9),
+      panel.grid.minor = element_blank(),
+      panel.spacing = unit(1.2, "lines"),
+      legend.position = "bottom"
+    )
+}
+# 4. Generate the Plots
+p_summary <- make_final_eeg_plot(df_summary_plot, "EEG Sleep Continuity", "#1B4F72")
+p_stages  <- make_final_eeg_plot(df_stages_plot, "EEG Sleep Architecture", "#0E6251")
+
+# 5. Display
+print(p_summary)
+
+
+# 6. Save the Plots
+ggsave(file.path(fig_dir, "Sleep_continuity.jpg"), p_summary, width = 6, height = 9, dpi = 600)
+
+
+print(p_stages)
+
+ggsave(file.path(fig_dir, "Sleep_stages.jpg"), p_stages, width = 6, height = 7, dpi = 600)
+```
+
+#  Create heat map of sleep stage changes
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# 1. PATH SETUP (Now platform-independent)
+input_path <- here::here("Data", "raw", "EEG", "hypnograms_txt")
+
+# 2. Verify and Load
+if (!dir.exists(input_path)) {
+  stop("Path not found! Check if 'Data/raw/EEG/hypnograms_txt' exists in your Project folder.")
+}
+
+all_files <- list.files(input_path, pattern = "\\.txt$", full.names = TRUE, ignore.case = TRUE)
+
+cat("Success! Found", length(all_files), "files in:", input_path)
+all_files <- list.files(input_path, pattern = "\\.txt$", full.names = TRUE)
+
+# --- 1. UPDATED LOADER (Ensures Real_ID exists) ---
+read_hypno_by_date <- function(f) {
+  fname <- basename(f)
+  
+  # Extract ID (First 3 digits) and Date (YYYY_MM_DD)
+  subj_id  <- stringr::str_extract(fname, "^\\d{3}")
+  date_str <- stringr::str_extract(fname, "\\d{4}_\\d{2}_\\d{2}")
+  
+  # Skip file if naming doesn't match expected pattern
+  if(is.na(subj_id) | is.na(date_str)) return(NULL)
+  
+  # Read the numeric data
+  df <- tryCatch({
+    read.table(f, header = FALSE, sep = "") 
+  }, error = function(e) return(NULL))
+  
+  if(is.null(df) || ncol(df) < 1) return(NULL)
+  
+  # Standardize and add metadata
+  df %>%
+    rename(stage = V1, exclude = V2) %>%
+    filter(stage != 6, exclude == 0) %>% 
+    mutate(
+      stage_name = case_when(
+        stage == 0 ~ "Wake", stage == 1 ~ "N1", stage == 2 ~ "N2",
+        stage == 3 ~ "N3", stage %in% c(4, 5) ~ "REM", TRUE ~ NA_character_
+      ),
+      # ENSURE THESE COLUMNS ARE CREATED FOR EVERY ROW
+      Real_ID = paste0("REST_", subj_id),
+      file_date = lubridate::ymd(date_str),
+      is_bsl = str_detect(fname, "(?i)Bsl|Baseline")
+    )
+}
+
+# --- 2. RUN THE LOADING ---
+raw_master <- purrr::map_df(all_files, read_hypno_by_date)
+
+# Check if Real_ID actually exists now
+if(!"Real_ID" %in% names(raw_master)) stop("Real_ID column missing after load!")
+
+# --- 3. UNBLINDING AND LABELING ---
+unblinded_master <- raw_master %>%
+  group_by(Real_ID) %>%
+  # Ensure chronological order per participant
+  arrange(file_date, .by_group = TRUE) %>%
+  mutate(
+    day_type = if_else(is_bsl, "BSL", "Intervention")
+  ) %>%
+  # Now, within each participant, rank the 'Intervention' nights
+  group_by(Real_ID, day_type) %>%
+  mutate(
+    night_num = if_else(day_type == "Intervention", dense_rank(file_date), NA_integer_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Final Labeling
+    day_label = case_when(
+      day_type == "BSL" ~ "BSL",
+      night_num == 8 ~ "FU", # Logic: If 8th night after BSL, it's Follow Up
+      !is.na(night_num) ~ paste0("Night ", night_num),
+      TRUE ~ "Other"
+    ),
+    day_label = factor(day_label, levels = c("BSL", paste0("Night ", 1:7), "FU"))
+  )
+
+# --- 4. CALCULATE TRANSITIONS ---
+stage_order <- c("Wake", "N1", "N2", "N3", "REM")
+
+final_probs <- unblinded_master %>%
+  group_by(Real_ID, day_label) %>% # Calculate transitions WITHIN each night
+  mutate(
+    current = factor(stage_name, levels = stage_order),
+    next_s  = factor(lead(stage_name), levels = stage_order)
+  ) %>%
+  filter(!is.na(current), !is.na(next_s)) %>%
+  group_by(day_label, current, next_s) %>%
+  summarise(count = n(), .groups = 'drop_last') %>%
+  mutate(prob = (count / sum(count)) * 100) %>%
+  ungroup()
+
+bsl_vals <- final_probs %>%
+  filter(day_label == "BSL") %>%
+  select(current, next_s, bsl_prob = prob)
+
+diff_matrix <- final_probs %>%
+  filter(day_label != "BSL") %>%
+  left_join(bsl_vals, by = c("current", "next_s")) %>%
+  mutate(
+    bsl_prob = replace_na(bsl_prob, 0),
+    diff = prob - bsl_prob
+  )
+
+# --- 3. GENERATE THE ORDERED HEATMAP ---
+ggplot(diff_matrix, aes(x = current, y = next_s, fill = diff)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.1f%%", diff)), 
+            size = 2.5, fontface = "bold") +
+  scale_fill_gradient2(
+    low = "#4a1486", mid = "white", high = "#d95f0e", 
+    midpoint = 0, name = "Δ from BSL %"
+  ) +
+  facet_wrap(~day_label, ncol = 4) +
+  theme_minimal() +
+  labs(
+
+    x = "From Stage (Epoch n)", 
+    y = "To Stage (Epoch n+1)"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+
+library(ggplot2)
+
+# 1. DEFINE FILENAME AND PATH
+# Use here() to point specifically to your Figures/EEG folder
+output_path <- here::here("Figures", "EEG", "Figure S3.jpg")
+
+# 2. SAVE THE PLOT
+ggsave(
+  filename = output_path,
+  plot = last_plot(),       
+  device = "jpeg",           # Changed to 'jpeg' for consistency with .jpg extension
+  dpi = 300,                
+  width = 12,                
+  height = 6,                
+  units = "in"
+)
+
+message("Success! Plot saved to: ", output_path)
+```
+
+
+
+
+# Session info
+```{r session-info}
+sessioninfo::session_info()
+```
+
+
