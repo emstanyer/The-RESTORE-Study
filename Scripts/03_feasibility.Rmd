@@ -1,0 +1,180 @@
+---
+title: "Feasibility and Acceptability Analysis"
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+params:
+  data_dir: "Data/raw/feasibility"
+  fig_dir: "Figures/feasibility"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Force the Knit directory to be the Project Root
+knitr::opts_knit$set(root.dir = here::here())
+
+library(tidyverse)
+library(readxl)
+library(here) 
+library(ggprism)
+library(fs) # Added fs for cleaner directory management
+
+# Define absolute paths using here()
+discomfort_path <- here("Data", "raw", "feasibility", "discomfort_data.xlsx")
+completion_path <- here("Data", "raw", "feasibility", "raw_completion.csv")
+fig_path        <- here("Figures", "feasibility")
+
+# Create the folder at the root level (fs::dir_create is safer/cleaner)
+if (!fs::dir_exists(fig_path)) fs::dir_create(fig_path)
+```
+
+# 1. Combined Feasibility Analysis: Discomfort, Completion, and Streaks
+```{r feasibility-analysis}
+
+library(tidyverse)
+library(readxl)
+library(here)
+
+# 1. Load and Clean Data
+# Using the anchored paths defined in your setup
+discomfort_raw <- read_xlsx(here(discomfort_path)) %>%
+  mutate(discomfort_rating = as.numeric(as.character(discomfort_rating)))
+
+raw_feasibility_data <- read_csv(here(completion_path))
+
+# 2. DISCOMFORT SUMMARY
+discomfort_stats <- discomfort_raw %>% 
+  summarise(
+    Metric = "Discomfort Rating (0-10)",
+    Value = median(discomfort_rating, na.rm = TRUE),
+    Dispersion = paste0("IQR: ", IQR(discomfort_rating, na.rm = TRUE), 
+                        " [", quantile(discomfort_rating, 0.25, na.rm = TRUE), 
+                        "-", quantile(discomfort_rating, 0.75, na.rm = TRUE), "]")
+  )
+
+# 3. COMPLETION SUMMARY (Participant Level)
+participant_completion <- raw_feasibility_data %>%
+  group_by(id) %>%
+  summarise(
+    percent_complete = (sum(complete == 1) / n()) * 100,
+    .groups = "drop"
+  )
+
+completion_stats <- participant_completion %>%
+  summarise(
+    Metric = "Overall Participant Completion (%)",
+    Value = mean(percent_complete, na.rm = TRUE),
+    Dispersion = paste0("SD: ", round(sd(percent_complete, na.rm = TRUE), 2))
+  )
+
+# 4. CONSECUTIVE STREAK ANALYSIS (Nights 3-9)
+streak_stats <- raw_feasibility_data %>%
+  filter(night >= 3 & night <= 9) %>%
+  arrange(id, night) %>%
+  group_by(id) %>%
+  # Logic: Identify groups of consecutive identical 'complete' values
+  mutate(streak_id = cumsum(complete != lag(complete, default = first(complete)))) %>%
+  filter(complete == 1) %>%
+  group_by(id, streak_id) %>%
+  summarise(streak_len = n(), .groups = "drop") %>%
+  group_by(id) %>%
+  summarise(max_streak = max(streak_len), .groups = "drop") %>%
+  summarise(
+    Metric = "Max Consecutive Nights (Nights 3-9)",
+    Value = mean(max_streak, na.rm=TRUE),
+    Dispersion = paste0("SD: ", round(sd(max_streak, na.rm=TRUE), 2))
+  )
+
+# 5. COMBINE INTO FINAL SUMMARY TABLE
+feasibility_master_table <- bind_rows(discomfort_stats, completion_stats, streak_stats)
+
+# Display results
+knitr::kable(feasibility_master_table, digits = 2, 
+             caption = "Table 1: Participant Feasibility, Completion, and Adherence Metrics")
+
+# Export for your records
+write_csv(feasibility_master_table, here("Output/feasibility/feasibility_summary_stats.csv"))
+```
+
+# 2. Feasibility Visualization: Completion Rates, Discomfort Ratings, and Streaks
+
+```{r}
+library(tidyverse)
+library(patchwork)
+library(here)
+
+completion_summary <- raw_feasibility_data %>%
+  summarise(
+    complete_count = sum(complete == 1),
+    incomplete_count = sum(complete == 0)
+  ) %>%
+  gather(key = "status", value = "count") %>%
+  mutate(percentage = count / sum(count) * 100)
+
+completion_summary_7 <- raw_feasibility_data %>%
+  filter(night >= 3 & night <= 9) %>%
+  summarise(
+    complete_count = sum(complete == 1),
+    incomplete_count = sum(complete == 0)
+  ) %>%
+  gather(key = "status", value = "count") %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# 1. Panel A: Overall Rate (Pie) - Cleaner & Bigger
+p_overall <- ggplot(completion_summary, aes(x = "", y = count, fill = status)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            position = position_stack(vjust = 0.5), size = 5) + 
+  theme_void() +
+  theme(legend.position = "none", plot.title = element_blank()) +
+  scale_fill_manual(values = c("complete_count" = "skyblue", "incomplete_count" = "salmon"))
+
+# 2. Panel B: Nights 3-9 (Pie)
+p_subset <- ggplot(completion_summary_7, aes(x = "", y = count, fill = status)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = paste0(round(percentage, 1), "%")), 
+            position = position_stack(vjust = 0.5), size = 5) + 
+  theme_void() +
+  theme(legend.position = "none", plot.title = element_blank()) +
+  scale_fill_manual(values = c("complete_count" = "skyblue", "incomplete_count" = "salmon"))
+
+# 3. Panel C: Nightly Completion (Bar)
+p_bar <- raw_feasibility_data %>%
+  group_by(night) %>%
+  summarise(freq = sum(complete == 1) / n(), .groups = "drop") %>%
+  ggplot(aes(x = as.factor(night), y = freq)) + 
+  geom_bar(stat = "identity", fill = "skyblue", color = "black", width = 0.8) + 
+  labs(x = "Night", y = "Proportion Completed") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.1)) + 
+  theme_classic() +
+  theme(plot.title = element_blank())
+
+# 4. Panel D: Discomfort Rating (Histogram)
+p_discomfort <- discomfort_raw %>%
+  ggplot(aes(x = discomfort_rating)) +
+  geom_histogram(binwidth = 1, fill = "#a494d2", color = "black") +
+  scale_x_continuous(breaks = 0:10) +
+  labs(x = "Discomfort Rating (0-10)", y = "Frequency") +
+  theme_classic() +
+  theme(plot.title = element_blank())
+
+# 5. ARRANGE IN A 2x2 GRID
+# (Top row: Pies) / (Bottom row: Bar & Histogram)
+final_composite <- (p_overall + p_subset) / (p_bar + p_discomfort) + 
+  plot_annotation(tag_levels = 'A')
+
+# 6. Save and Print
+print(final_composite)
+
+ggsave(here("Output/feasibility/feasibility_results.png"), 
+       final_composite, width = 10, height = 10, dpi = 300)
+```
+
+
+
