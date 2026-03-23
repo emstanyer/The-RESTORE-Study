@@ -1,0 +1,389 @@
+---
+title: "Spectral Analysis"
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+params:
+
+  profile_dir: "Data/raw/EEG/PSD/"   # spectral output from spisop .csv files
+  blinding_file: "Data/raw/EEG/blinding_files/unblinding_spectral.csv"  # has ParticipantID, Timepoint, Original_filename
+  out_dir: "Output/EEG/PSD"
+  fig_dir: "Figures/EEG/PSD"
+---
+
+# Setup
+```{r setup, include=FALSE}
+# 1. FORCE THE KNIT ROOT (Crucial for GitHub and organized sub-folders)
+knitr::opts_knit$set(root.dir = here::here())
+
+# 2. Standard options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 10, fig.height = 4.8)
+
+# 3. Load Libraries
+suppressPackageStartupMessages({
+  library(readr)
+  library(readxl)
+  library(dplyr)
+  library(tidyr)
+  library(here) # install.packages("here")
+  library(lubridate)
+  library(stringr)
+  library(ggplot2)
+  library(ggprism)
+  library(writexl)
+  library(knitr)
+  library(kableExtra)
+  library(sessioninfo)
+  library(lme4)
+  library(emmeans)
+  library(purrr)
+  library(fs) # Added fs for cleaner folder management
+})
+
+# 4. Paths (Anchored to Root)
+# This ensures "Output/" and "Figures/" stay in the root, not the sub-folder
+out_dir <- here::here(params$out_dir)
+fig_dir <- here::here(params$fig_dir)
+
+# 5. Create Directories
+# fs::dir_create is safer and won't overwrite existing data
+fs::dir_create(c(out_dir, fig_dir))
+```
+
+# 1. Read in the spectral data
+```{r}
+library(dplyr)
+library(here)
+library(readr)
+
+# Use here() to anchor the path to the project root
+band_power        <- read_csv(here("Data", "raw", "EEG", "PSD", "BandPower_Night.csv"), show_col_types = FALSE)
+percent_power     <- read_csv(here("Data", "raw", "EEG", "PSD", "PercPower_Night.csv"), show_col_types = FALSE)
+percent_power_REM <- read_csv(here("Data", "raw", "EEG", "PSD", "PercPower_Night_REM.csv"), show_col_types = FALSE)
+band_power_REM    <- read_csv(here("Data", "raw", "EEG", "PSD", "BandPower_Night_REM.csv"), show_col_types = FALSE)
+
+band_power <- band_power %>%
+  mutate(Night = recode(Night, 
+                        "Baseline" = "BSL",
+                        "SRT_1"    = "1",
+                        "SRT_2"    = "2",
+                        "SRT_3"    = "3",
+                        "SRT_4"    = "4",
+                        "SRT_5"    = "5",
+                        "SRT_6"    = "6",
+                        "SRT_7"    = "7",
+                        "FollowUp" = "FU"))
+
+percent_power <- percent_power %>%
+  mutate(Night = recode(Night, 
+                        "Baseline" = "BSL",
+                        "SRT_1"    = "1",
+                        "SRT_2"    = "2",
+                        "SRT_3"    = "3",
+                        "SRT_4"    = "4",
+                        "SRT_5"    = "5",
+                        "SRT_6"    = "6",
+                        "SRT_7"    = "7",
+                        "FollowUp" = "FU"))
+
+percent_power_REM <- percent_power_REM %>%
+  mutate(Night = recode(Night, 
+                        "Baseline" = "BSL",
+                        "SRT_1"    = "1",
+                        "SRT_2"    = "2",
+                        "SRT_3"    = "3",
+                        "SRT_4"    = "4",
+                        "SRT_5"    = "5",
+                        "SRT_6"    = "6",
+                        "SRT_7"    = "7",
+                        "FollowUp" = "FU"))
+
+band_power_REM <- band_power_REM %>%
+  mutate(Night = recode(Night, 
+                        "Baseline" = "BSL",
+                        "SRT_1"    = "1",
+                        "SRT_2"    = "2",
+                        "SRT_3"    = "3",
+                        "SRT_4"    = "4",
+                        "SRT_5"    = "5",
+                        "SRT_6"    = "6",
+                        "SRT_7"    = "7",
+                        "FollowUp" = "FU"))
+```
+
+# 2. Plot the data
+```{r}
+# 1. Prepare NREM data (All bands)
+plot_df_nrem <- percent_power %>%
+  select(Night, Participant, contains("(Mean)")) %>%
+  pivot_longer(cols = contains("(Mean)"), names_to = "variable", values_to = "value") %>%
+  mutate(
+    variable = paste0("NREM ", str_remove(variable, " \\(Mean\\)")),
+    Stage = "NREM"
+  )
+
+# 2. Prepare REM data (Theta only)
+plot_df_rem <- percent_power_REM %>%
+  select(Night, Participant, contains("(Mean)")) %>%
+  pivot_longer(cols = contains("(Mean)"), names_to = "variable", values_to = "value") %>%
+  filter(str_detect(variable, "Theta")) %>%
+  mutate(
+    variable = "REM Theta",
+    Stage = "REM"
+  )
+# Define the order of nights for all plots in this study
+day_levels <- c("BSL", "1", "2", "3", "4", "5", "6", "7", "FU")
+
+# 3. Combine and Summarize
+# Define custom order: NREM bands first, then REM Theta
+freq_order <- c("NREM SWA", "NREM Delta", "NREM Theta", "NREM Alpha", 
+               "NREM Sigma", "NREM Beta", "REM Theta")
+
+plot_df_combined <- bind_rows(plot_df_nrem, plot_df_rem) %>%
+  group_by(Night, variable, Stage) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    se = sd(value, na.rm = TRUE) / sqrt(pmax(sum(!is.na(value)), 1)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Night = factor(Night, levels = day_levels),
+    variable = factor(variable, levels = freq_order)
+  )
+
+# 4. Create the Plot
+# 4. Create the Plot
+p_combined <- ggplot(plot_df_combined, aes(x = Night, y = mean, group = 1, color = Stage)) +
+  geom_point(size = 3, shape = 17) +
+  geom_line(linewidth = 1) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_minimal() + 
+  scale_color_manual(values = c("NREM" = "#bc5090", "REM" = "#0091d4")) +
+  theme(
+    # Remove all grid lines
+    panel.grid = element_blank(),
+    # Add solid black lines to both axes
+    axis.line = element_line(colour = "black", linewidth = 0.8),
+    # Styling text
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold"), 
+    legend.position = "none"
+  ) +
+  labs(
+    x = "Study Night", 
+    y = expression(bold("Percentage Band Power (%)")),
+    color = "Sleep Stage"
+  )
+
+# 5. Save the plot to fig_dir
+ggsave(
+  filename = here(fig_dir, "Figure 5.tiff"), 
+  plot = p_combined, 
+  width = 10, 
+  height = 7, 
+  dpi = 300,
+  compression = "lzw"
+)
+
+ggsave(
+  filename = here::here(params$fig_dir, "Figure 5.jpg"), 
+  plot = p_combined, 
+  width = 10, 
+  height = 7, 
+  dpi = 300
+)
+
+# Display the plot
+print(p_combined)
+```
+
+
+# 3. Summary stats REM theta - relative and absolute
+```{r}
+# Define the summary function
+get_summary_table <- function(data, unit_label = "") {
+  data %>%
+    # 1. Convert band columns (Delta (Mean), etc.) into a long format
+    pivot_longer(
+      cols = contains("(Mean)"), 
+      names_to = "band", 
+      values_to = "value"
+    ) %>%
+    # 2. Clean up band names
+    mutate(band = str_remove(band, " \\(Mean\\)")) %>%
+    # 3. Calculate statistics
+    group_by(Night, band) %>%
+    summarise(
+      n  = sum(!is.na(value)),
+      mn = mean(value, na.rm = TRUE),
+      sd = sd(value, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    # 4. Format and ensure correct night ordering
+    mutate(
+      `Mean (SD)` = sprintf("%.2f (%.2f)%s", mn, sd, unit_label),
+      Night = factor(Night, levels = c("BSL", "1", "2", "3", "4", "5", "6", "7", "FU"))
+    ) %>%
+    arrange(Night, band)
+}
+
+# --- 1. Generate Summaries ---
+# Absolute Power (microvolts squared)
+rem_abs_summary <- get_summary_table(band_power_REM)
+rem_theta_abs_summary <- rem_abs_summary %>% filter(band == "Theta")
+
+# Relative/Percent Power (%)
+rem_rel_summary <- get_summary_table(percent_power_REM, unit_label = "%")
+rem_theta_rel_summary <- rem_rel_summary %>% filter(band == "Theta")
+
+
+# --- 2. Create HTML Tables for the Report ---
+rem_theta_rel_summary %>%
+  select(Night, n, `Mean (SD)`) %>%
+  kable(caption = "REM Theta Relative Power Summary (%)") %>%
+  kable_styling(full_width = FALSE)
+
+
+```
+
+# 4. Summary stats NREM all bands - relative power 
+```{r summary_band_stats, relative}
+# --- 1. NREM Absolute Power Summary (All Bands) ---
+nrem_abs_summary <- get_summary_table(band_power)
+
+# Display NREM Absolute Summary Table
+nrem_abs_summary %>%
+  select(Night, band, n, `Mean (SD)`) %>%
+  kable(caption = "NREM Absolute Power Summary (microvolts squared) - All Bands") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+
+# --- 2. NREM Relative Power Summary (All Bands) ---
+nrem_rel_summary <- get_summary_table(percent_power, unit_label = "%")
+
+# Display NREM Relative Summary Table
+nrem_rel_summary %>%
+  select(Night, band, n, `Mean (SD)`) %>%
+  kable(caption = "NREM Relative Power Summary (%) - All Bands") %>%
+  kable_styling(full_width = FALSE, bootstrap_options = "striped")
+
+```
+
+# 5. LMM and Formatted Table for report
+```{r}
+# 1. Data Prep Function
+prep_data_long <- function(df) {
+  df %>%
+    pivot_longer(cols = contains("(Mean)"), names_to = "band", values_to = "value") %>%
+    mutate(
+      band = str_remove(band, " \\(Mean\\)"),
+      Night = factor(Night, levels = c("BSL", "1", "2", "3", "4", "5", "6", "7", "FU"))
+    )
+}
+
+# 2. LMM Function
+run_lmm_with_n <- function(long_df) {
+  bands <- unique(long_df$band)
+  map_dfr(bands, function(b) {
+    dat <- filter(long_df, band == b) %>% filter(!is.na(value)) %>% droplevels()
+    
+    stats <- dat %>%
+      group_by(Night) %>%
+      summarise(n_night = n_distinct(Participant), mn = mean(value, na.rm=TRUE), sd = sd(value, na.rm=TRUE), .groups = "drop")
+
+    fit <- lmer(value ~ Night + (1|Participant), data = dat)
+    emm <- emmeans(fit, "Night")
+    ctr <- summary(contrast(emm, method = "trt.vs.ctrl", ref = 1), infer = c(TRUE, TRUE)) %>% as.data.frame()
+    d_sum <- summary(eff_size(emm, method = "trt.vs.ctrl", ref = 1, sigma = sigma(fit), edf = df.residual(fit))) %>% as.data.frame()
+    
+    ctr <- ctr %>% mutate(Night = str_remove(contrast, " - BSL"))
+    d_sum <- d_sum %>% mutate(Night = str_remove(contrast, " - BSL"))
+    
+    stats %>%
+      left_join(select(ctr, Night, estimate, lower.CL, upper.CL), by = "Night") %>%
+      left_join(select(d_sum, Night, d = effect.size), by = "Night") %>%
+      mutate(band = b, n_total = n_distinct(dat$Participant))
+  })
+}
+
+# 3. HTML Table Function (for RMarkdown display)
+format_pub_table_with_n <- function(results_df, title = "Table") {
+  display_df <- results_df %>%
+    mutate(
+      `Mean (SD)` = sprintf("%.2f (%.2f)", mn, sd),
+      Diff_adj = ifelse(Night == "BSL", "-", sprintf("%.2f", estimate)),
+      `95% CI` = ifelse(Night == "BSL", "-", sprintf("%.2f to %.2f", lower.CL, upper.CL)),
+      d = ifelse(Night == "BSL", "-", sprintf("%.2f", d)),
+      Night_Label = recode(Night, "BSL" = "Baseline", "FU" = "Follow up", 
+                          "1"="Night 1", "2"="Night 2", "3"="Night 3", "4"="Night 4", 
+                          "5"="Night 5", "6"="Night 6", "7"="Night 7")
+    ) %>%
+    group_by(band) %>%
+    do({
+      header_row <- tibble(Night_Label = paste0("**", .$band[1], " (n = ", .$n_total[1], ")**"),
+                           `Mean (SD)` = "", Diff_adj = "", `95% CI` = "", d = "")
+      bind_rows(header_row, select(., Night_Label, `Mean (SD)`, Diff_adj, `95% CI`, d))
+    }) %>% ungroup() %>% select(Night_Label, `Mean (SD)`, Diff_adj, `95% CI`, d)
+
+  indent_rows <- which(!grepl("\\*\\*", display_df$Night_Label))
+  display_df %>%
+    knitr::kable(escape = FALSE, caption = title, col.names = c("Power Spectral Density", "Mean (SD)", "Diff_adj", "95% CI", "d")) %>%
+    kable_styling(full_width = FALSE) %>% add_indent(indent_rows)
+}
+```
+
+# 6. Formatted Tables
+```{r}
+# --- 1. Run Statistical Models (Absolute & Relative) ---
+# NREM
+res_nrem_abs <- run_lmm_with_n(prep_data_long(band_power))
+res_nrem_rel <- run_lmm_with_n(prep_data_long(percent_power))
+
+# REM (Theta only)
+res_rem_abs <- run_lmm_with_n(prep_data_long(band_power_REM)) %>% filter(band == "Theta")
+res_rem_rel <- run_lmm_with_n(prep_data_long(percent_power_REM)) %>% filter(band == "Theta")
+
+# --- 2. Display Tables in Report (Relative as Example) ---
+format_pub_table_with_n(res_nrem_rel, "Table: NREM Relative Power (%)")
+format_pub_table_with_n(res_rem_rel, "Table: REM Theta Relative Power (%)")
+
+# --- 3. Save All to Excel (4 Sheets) ---
+get_pub_table_df <- function(results_df) {
+  results_df %>%
+    mutate(
+      `Mean (SD)` = sprintf("%.2f (%.2f)", mn, sd),
+      Diff_adj = ifelse(Night == "BSL", "-", sprintf("%.2f", estimate)),
+      `95% CI` = ifelse(Night == "BSL", "-", sprintf("%.2f to %.2f", lower.CL, upper.CL)),
+      `Cohen's d` = ifelse(Night == "BSL", "-", sprintf("%.2f", d)),
+      Timepoint = recode(Night, "BSL" = "Baseline", "FU" = "Follow up", "1"="Night 1", "2"="Night 2", "3"="Night 3", "4"="Night 4", "5"="Night 5", "6"="Night 6", "7"="Night 7")
+    ) %>%
+    select(band, Timepoint, `Mean (SD)`, Diff_adj, `95% CI`, `Cohen's d`)
+}
+
+wb <- openxlsx::createWorkbook()
+
+# Add NREM Sheets
+openxlsx::addWorksheet(wb, "NREM_Absolute")
+openxlsx::writeData(wb, "NREM_Absolute", get_pub_table_df(res_nrem_abs))
+
+openxlsx::addWorksheet(wb, "NREM_Relative")
+openxlsx::writeData(wb, "NREM_Relative", get_pub_table_df(res_nrem_rel))
+
+# Add REM Sheets
+openxlsx::addWorksheet(wb, "REM_Theta_Absolute")
+openxlsx::writeData(wb, "REM_Theta_Absolute", get_pub_table_df(res_rem_abs))
+
+openxlsx::addWorksheet(wb, "REM_Theta_Relative")
+openxlsx::writeData(wb, "REM_Theta_Relative", get_pub_table_df(res_rem_rel))
+
+# Save the workbook
+openxlsx::saveWorkbook(wb, here(out_dir, "PSD_LMM_results.xlsx"), overwrite = TRUE)
+```
+
