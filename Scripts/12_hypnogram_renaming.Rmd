@@ -1,0 +1,63 @@
+```{r}
+library(readxl)
+library(writexl)
+library(dplyr)
+library(stringr)
+library(here)
+
+# 1. Setup paths
+input_dir  <- here("Data", "raw", "EEG", "hypnograms_xls")
+output_dir <- here("Data", "processed", "EEG", "unblinded_hypnograms")
+
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 2. Load Blinding Key
+blinding_key <- read_excel(here("Data", "raw", "EEG", "blinding_files", "blinding.xlsx")) %>%
+  mutate(ParticipantID = as.numeric(ParticipantID))
+
+# 3. Get file list
+blinded_files <- list.files(input_dir, pattern = "\\.xlsx$", full.names = TRUE)
+
+# 4. Multi-sheet processing loop
+unblind_log <- lapply(blinded_files, function(file_path) {
+  
+  # Extract the ID number from the start of the filename (e.g., "130")
+  file_id <- as.numeric(str_extract(basename(file_path), "^\\d+"))
+  
+  # Find the corresponding unblinded name
+  match_row <- blinding_key %>% filter(ParticipantID == file_id)
+  
+  if (nrow(match_row) == 0) {
+    message(paste("Warning: No match found for ID:", file_id))
+    return(NULL)
+  }
+  
+  # Define the new filename
+  new_name <- paste0(match_row$Original_filename, ".xlsx")
+  dest_path <- file.path(output_dir, new_name)
+  
+  # --- THE MULTI-SHEET LOGIC ---
+  # 1. Identify all sheets in the current blinded file
+  s_names <- excel_sheets(file_path)
+  
+  # 2. Read every sheet into a list
+  all_sheets_list <- lapply(s_names, function(s) {
+    read_excel(file_path, sheet = s)
+  })
+  
+  # 3. Assign names to the list (so writexl makes tabs with these names)
+  names(all_sheets_list) <- s_names
+  
+  # 4. Export the whole list as a multi-tab Excel file
+  write_xlsx(all_sheets_list, dest_path)
+  # -----------------------------
+  
+  return(data.frame(Old_ID = file_id, New_Name = new_name))
+})
+
+# 5. Review results
+final_log <- bind_rows(unblind_log)
+cat("\n--- Unblinding Complete (All Sheets Preserved) ---\n")
+cat("Total files processed:", nrow(final_log), "\n")
+```
+
