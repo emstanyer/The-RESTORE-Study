@@ -1,6 +1,5 @@
 # --- DATA PRIVACY ---
 Data/
-Output/
 *.csv
 *.txt
 *.xlsx

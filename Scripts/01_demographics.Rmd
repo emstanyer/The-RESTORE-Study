@@ -1,0 +1,166 @@
+---
+title: "Baseline Demographic and Clinical Variables Analysis"
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+params:
+  data_file: "Data/raw/demographics/baseline_data.csv"
+  out_dir: "Output/demographics"
+---
+
+```{r setup, include=FALSE}
+
+# 1. Force RMarkdown to use the Project Root for EVERYTHING
+knitr::opts_knit$set(root.dir = here::here())
+
+# 2. Standard options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# 3. Load Libraries
+library(tidyverse)
+library(ggprism)
+library(writexl)
+library(here) 
+library(fs) # Highly recommended for directory management
+
+# 4. Define and Create Paths
+# By wrapping in here(), we ensure it's relative to .Rproj, not the .Rmd
+out_path <- here::here(params$out_dir)
+
+if (!fs::dir_exists(out_path)) {
+  fs::dir_create(out_path, recurse = TRUE)
+}
+```
+
+# Read in baseline data and clean column names
+```{r}
+# Using here() to anchor the path
+bsl_path <- here("Data", "raw", "demographics", "baseline_data.csv")
+
+if (!file.exists(bsl_path)) stop("Check file path: ", bsl_path)
+
+BSL <- read_csv(bsl_path) %>%
+  # Gender/Sex Factor
+  mutate(gender = factor(sex, levels = c(1, 2), labels = c("Female", "Male"))) %>%
+  # Education Factor
+  mutate(education_level = factor(education, 
+                                  levels = 1:6, 
+                                  labels = c("None", "GCSE", "Alevel", "Undergraduate", "Postgraduate", "Chooseno"))) %>%
+  # Marital Factor
+  mutate(marital_status = factor(marital, 
+                                 levels = 1:6, 
+                                 labels = c("single", "married", "divorced", "widowed", "separated", "chooseno"))) %>%
+
+  # Handle Caffeine NAs
+  mutate(caffeine = ifelse(is.na(caffeine), 0, caffeine)) %>%
+  # Chronotype Category
+  mutate(chronotype_cat = case_when(
+    chronotype <= 41 ~ "evening",
+    chronotype >= 59 ~ "morning",
+    chronotype >= 42 & chronotype <= 58 ~ "intermediate"
+  ))
+```
+
+# Create table for the manuscript
+```{r}
+
+library(tidyverse)
+library(gtsummary)
+library(flextable)
+
+# 1. Final Data Preparation
+table_input <- BSL %>%
+  mutate(
+    gender = factor(sex),
+    ethnicity = factor(ethnicity),
+    marital_status = factor(marital),
+    # Ensure numeric types for precision
+    age = as.numeric(age),
+    HADS = as.numeric(HADS),
+    ISI = as.numeric(ISI),
+    caffeine = as.numeric(caffeine),
+    chronotype = as.numeric(chronotype),
+    # Binary Thresholds
+    hads_above_8 = ifelse(HADS >= 8, 1, 0),
+    isi_above_11 = ifelse(ISI >= 11, 1, 0),
+    caff_low     = ifelse(caffeine < 400, 1, 0),
+    caff_high    = ifelse(caffeine >= 400, 1, 0)
+  )
+
+# 2. Build the Publication Table
+summary_table <- table_input %>%
+  select(
+    gender, age, ethnicity, education, marital_status, 
+    HADS, hads_above_8, 
+    ISI, isi_above_11, 
+    caffeine, caff_low, caff_high, 
+    chronotype, chronotype_cat
+  ) %>%
+  tbl_summary(
+    type = list(
+      age ~ "continuous",
+      HADS ~ "continuous",
+      ISI ~ "continuous",
+      caffeine ~ "continuous",
+      chronotype ~ "continuous",
+      hads_above_8 ~ "dichotomous",
+      isi_above_11 ~ "dichotomous",
+      caff_low     ~ "dichotomous",
+      caff_high    ~ "dichotomous"
+    ),
+    value = list(
+      hads_above_8 ~ "1",
+      isi_above_11 ~ "1",
+      caff_low     ~ "1",
+      caff_high    ~ "1"
+    ),
+    label = list(
+      gender ~ "Male, n (%)",
+      age ~ "Age (years), mean (SD)",
+      ethnicity ~ "Ethnicity, n (%)",
+      marital_status ~ "Marital status, n (%)",
+      HADS ~ "HADS-D score (Mean, SD)",
+      hads_above_8 ~ "HADS-D score ≥8 (n)",
+      education ~ "Education level, n (%)",
+      ISI ~ "ISI score (Mean, SD)",
+      isi_above_11 ~ "ISI score ≥11 (n)",
+      caffeine ~ "CCQ-R score (mg/day; Mean, SD)",
+      caff_low ~ "CCQ-R score <400mgday (n)",
+      caff_high ~ "CCQ-R score ≥400mgday (n)",
+      chronotype ~ "MEQ score (Mean, SD)",
+      chronotype_cat ~ "Chronotype, n (%)"
+    ),
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)",
+      c(hads_above_8, isi_above_11, caff_low, caff_high) ~ "{n}"
+    ),
+    # Force 2 decimal places for all continuous variables
+    digits = list(all_continuous() ~ 2),
+    missing = "no"
+  ) %>%
+  # Filter to show only 'Male'
+  modify_table_body(
+    ~ .x %>% filter(!(variable == "gender" & label == "Female"))
+  ) %>%
+  # Append the Age Range directly under the Age Mean
+  modify_table_body(
+    ~ .x %>%
+      mutate(stat_0 = if_else(variable == "age", 
+                              paste0(stat_0, "\n", min(table_input$age, na.rm=T), "-", max(table_input$age, na.rm=T)), 
+                              stat_0))
+  ) %>%
+  modify_header(label = "**Characteristic**", stat_0 = "**Value**") %>%
+  bold_labels()
+
+summary_table
+ # save as word file to output directory
+save_as_docx(summary_table, path = here(params$out_dir, "demographics_summary_table.docx"))
+
+```
+
+
