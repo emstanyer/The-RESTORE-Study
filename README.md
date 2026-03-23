@@ -2,11 +2,18 @@
 
 **Study Title:** Insights from nine nights of self-applied, low-density sleep EEG during sleep restriction therapy: a proof-of-concept evaluation 
 
+Principal Investigator: Dr Emily Stanyer | University of Oxford
+This repository contains the complete analytical pipeline for processing actigraphy, light, sleep diary and EEG data from the RESTORE Study. 
+
 ## License
 This project is licensed under the **Creative Commons Attribution 4.0 International (CC-BY 4.0)**. 
 See the [LICENSE](LICENSE) file for details.
 
 * You can find the pre-print here:
+
+To run these scripts, you will need R (≥ 4.2.0) and the following packages:
+
+install.packages(c("tidyverse", "LightLogR", "patchwork", "lme4", "emmeans", "flextable", "here"))
 
 ## Attribution
 If you use this code, data, or the findings from the RESTORE study in your research, please cite it as follows:
