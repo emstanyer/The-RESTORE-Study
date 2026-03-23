@@ -1,0 +1,524 @@
+---
+title: "adherence"
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Load libraries
+library(tidyverse)
+library(lubridate)
+library(ggprism)
+library(writexl)
+library(ggpubr)
+library(rstatix)
+library(broom)
+library(hms)
+library(scales)
+library(readxl)
+```
+
+#  read in prescribed and actual bed times
+```{r}
+
+library(here)
+
+bed_times <- read_csv(here("Data", "raw", "SRT", "Prescribed Sleep Windows", "set_bed_times.csv")) %>% 
+  mutate(
+    rise_time_set = dmy_hm(rise_time_set),
+    bed_time_set = dmy_hm(bed_time_set),
+    rise_time_actual_SD = dmy_hm(rise_time_actual_SD),
+    bed_time_actual_SD = dmy_hm(bed_time_actual_SD),
+    bed_date_actual_actigraphy = dmy(bed_date_actual_actigraphy),
+    rise_date_actual_actigraphy = dmy(rise_date_actual_actigraphy),
+    bed_time_actual_actigraphy = as.POSIXct(paste(bed_date_actual_actigraphy, bed_time_actual_actigraphy)),
+    rise_time_actual_actigraphy = as.POSIXct(paste(rise_date_actual_actigraphy, rise_time_actual_actigraphy))
+  ) %>%
+  select(-bed_date_actual_actigraphy, -rise_date_actual_actigraphy)
+
+# Harmonize times & compute time differences
+bed_times_after <- bed_times %>%
+  mutate(across(
+    c(bed_time_set, rise_time_set, bed_time_actual_SD, rise_time_actual_SD,
+      bed_time_actual_actigraphy, rise_time_actual_actigraphy),
+    ~ with_tz(force_tz(.x, "Europe/London"), "UTC")
+  )) %>%
+  mutate(
+    time_difference_bedtime_sleepdiary = as.numeric(difftime(bed_time_actual_SD, bed_time_set, units = "mins")),
+    time_difference_risetime_sleepdiary = as.numeric(difftime(rise_time_actual_SD, rise_time_set, units = "mins")),
+    time_difference_bedtime_actigraphy = as.numeric(difftime(bed_time_actual_actigraphy, bed_time_set, units = "mins")),
+    time_difference_risetime_actigraphy = as.numeric(difftime(rise_time_actual_actigraphy, rise_time_set, units = "mins"))
+  )
+
+# 3. Save processed data to root/Data/processed/SRT/
+# We use here() to ensure dir.create and write_xlsx look at the root, not the script folder
+processed_path <- here("Data", "processed", "SRT")
+
+if (!dir.exists(processed_path)) {
+  dir.create(processed_path, recursive = TRUE)
+}
+
+write_xlsx(bed_times_after, file.path(processed_path, "prescribed_and_actual_bed_times.xlsx"))
+```
+
+# Compute adherence scores
+```{r}
+# Sleep Diary Adherence
+sleepdiary_adherence_data <- bed_times_after %>%
+  mutate(
+    adherent_bedtime_sleepdiary = if_else(time_difference_bedtime_sleepdiary < -15, 0, 1),
+    adherent_risetime_sleepdiary = if_else(abs(time_difference_risetime_sleepdiary) > 15, 0, 1),
+    daily_adherence_score_SD = adherent_bedtime_sleepdiary + adherent_risetime_sleepdiary
+  )
+
+# Actigraphy Adherence
+actigraphy_adherence_data <- bed_times_after %>%
+  mutate(
+    adherent_bedtime_actigraphy = if_else(time_difference_bedtime_actigraphy < -15, 0, 1),
+    adherent_risetime_actigraphy = if_else(abs(time_difference_risetime_actigraphy) > 15, 0, 1),
+    daily_adherence_score_act = adherent_bedtime_actigraphy + adherent_risetime_actigraphy
+  )
+
+# Combine Methods
+adherence_summary_df <- sleepdiary_adherence_data %>%
+  left_join(
+    select(actigraphy_adherence_data, id, day,
+           adherent_bedtime_actigraphy, adherent_risetime_actigraphy, daily_adherence_score_act),
+    by = c("id", "day")
+  ) %>%
+  mutate(
+    both_methods_adherent = if_else(daily_adherence_score_SD == 2 & daily_adherence_score_act == 2, 1, 0)
+  )
+```
+
+
+```{r}
+completeness_summary <- bed_times_after %>%
+  group_by(id) %>%
+  summarise(
+    total_days = n(),
+    complete_days_SD = sum(!is.na(bed_time_actual_SD) & !is.na(rise_time_actual_SD)),
+    completeness_rate_SD = complete_days_SD / total_days,
+    incomplete_diary = completeness_rate_SD < 0.5,
+    complete_days_act = sum(!is.na(bed_time_actual_actigraphy) & !is.na(rise_time_actual_actigraphy)),
+    completeness_rate_act = complete_days_act / total_days,
+    incomplete_actigraphy = completeness_rate_act < 0.5,
+    .groups = "drop"
+  )
+
+knitr::kable(completeness_summary, caption = "Participant Data Completeness")
+```
+# Plot A
+```{r}
+
+library(here)
+library(tidyverse)
+library(hms)
+library(scales)
+library(ggprism)
+
+# 1. Read Data
+actigraphy_data <- read_csv(here("Data", "processed", "actigraphy", "actigraphy_data_clean.csv"))
+
+
+# 1. Process Data
+sleep_processed <- actigraphy_data %>%
+  mutate(
+    fell_asleep_hms = as_hms(`Fell asleep`),
+    woke_up_hms = as_hms(`Woke up`)
+  ) %>%
+  filter(!is.na(fell_asleep_hms), !is.na(woke_up_hms)) %>%
+  # Handle midnight wrap-around (18:00 threshold)
+  mutate(
+    bed_sec  = as.numeric(fell_asleep_hms),
+    wake_sec = as.numeric(woke_up_hms),
+    bed_sec  = ifelse(bed_sec < 18*3600, bed_sec + 86400, bed_sec),
+    wake_sec = ifelse(wake_sec < 18*3600, wake_sec + 86400, wake_sec)
+  )
+
+# 2. Summarize by Week
+sleep_summary <- sleep_processed %>%
+  group_by(Week) %>%
+  summarise(
+    across(c(bed_sec, wake_sec), list(
+      med  = ~median(.x, na.rm = TRUE), 
+      low  = ~quantile(.x, 0.25, na.rm = TRUE), 
+      high = ~quantile(.x, 0.75, na.rm = TRUE)
+    ))
+  ) %>%
+  # FIX: Automatically find and sort whatever labels are in the 'Week' column
+  mutate(
+    Week = as.character(Week),
+    # Sorts numerically so "Week 2" comes before "Week 10"
+    all_weeks = str_sort(unique(Week), numeric = TRUE),
+    # Ensure "Baseline" is always the first level
+    Week = factor(Week, levels = c("Baseline", setdiff(all_weeks, "Baseline")))
+  )
+
+# 3. Convert for ggplot
+sleep_summary <- sleep_summary %>%
+  mutate(across(contains("_sec_"), 
+                ~as.POSIXct(.x, origin = "1970-01-01", tz = "UTC"),
+                .names = "{.col}_dt"))
+
+# 4. Define Plot A (No Grids)
+plot_A <- ggplot(sleep_summary, aes(y = Week)) +
+  geom_linerange(aes(xmin = bed_sec_low_dt, xmax = bed_sec_high_dt), 
+                 linewidth = 8, color = "#7a5195", alpha = 0.4) +
+  geom_linerange(aes(xmin = wake_sec_low_dt, xmax = wake_sec_high_dt), 
+                 linewidth = 8, color = "#7a5195", alpha = 0.4) +
+  geom_linerange(aes(xmin = bed_sec_med_dt, xmax = wake_sec_med_dt), 
+                 linewidth = 8, color = "#003f5c") +
+  scale_y_discrete(limits = rev(levels(sleep_summary$Week))) +
+  scale_x_datetime(
+    labels = date_format("%H:%M"), 
+    breaks = date_breaks("2 hours"),
+    expand = expansion(mult = c(0.05, 0.05))
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_blank(), 
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1)
+  ) +
+  labs(
+    x = "Clock Time",
+    y = "Study Week"
+  )
+
+# View result
+plot_A
+```
+# plot B
+
+```{r tib-comparison-plot, fig.width=8, fig.height=6}
+
+# 1. Load Data Sources
+# Note: Ensure TIB_prescribed and ECG_processed were created in previous steps
+ECG_TIB_data <- read_csv(here("Data", "processed", "ECG", "TIB_ECG_data.csv"))
+
+
+# Process ECG data to match the standard format
+ECG_processed <- ECG_TIB_data %>%
+  mutate(
+    # 1. Convert character strings to actual Date-Time objects
+    start_dt = dmy_hm(Start),
+    end_dt   = dmy_hm(End),
+    
+    # 2. Calculate the difference in hours
+    TIB = as.numeric(difftime(end_dt, start_dt, units = "hours")),
+    
+    # 3. Standardize column names for the join
+    id = as.character(ParticipantID),
+    week = case_when(
+      Timepoint == "Baseline" ~ "BSL",
+      Timepoint == "Int"      ~ "1", # Adjust "1" if "Int" refers to a different week
+      TRUE ~ as.character(Timepoint)
+    ),
+    method = "ECG"
+  ) %>%
+  select(id, week, TIB, method)
+
+# 1. Load the pre-existing EEG summary file 
+# Ensure you are using read_excel from the readxl library
+library(readxl)
+library(tidyverse)
+
+eeg_clean <- read_excel(here("Data", "processed", "EEG", "clean_EEG_data.xlsx"))
+
+# 2. Process EEG data for the plot (Using explicit dplyr functions to avoid errors)
+EEG_processed <- eeg_clean %>%
+  dplyr::mutate(
+    # Handle the numeric conversion for TIB
+    TIB = as.numeric(`TIB (mins)`) / 60, 
+    # Use as.integer then as.character to strip any decimals from IDs (e.g., 2.0 -> "2")
+    id  = as.character(as.integer(Real_ID)), 
+    week = case_when(
+      Timepoint == "BSL" ~ "BSL",
+      Timepoint == "SRT" ~ "1",
+      TRUE ~ as.character(Timepoint)
+    ),
+    method = "EEG"
+  ) %>%
+  dplyr::select(id, week, TIB, method)
+
+# 3. Create TIB_prescribed (Excluding ECG)
+TIB_prescribed <- bed_times %>%
+  dplyr::mutate(
+    TIB = as.numeric(difftime(rise_time_set, bed_time_set, units = "hours")),
+    method = "Prescribed",
+    week = as.character(week) 
+  ) %>%
+  dplyr::select(id, week, TIB, method)
+
+# 4. Combine Raw Data (EXCLUDING ECG)
+TIB_raw_combined <- bind_rows(
+  TIB_prescribed %>% dplyr::mutate(id = as.character(id)),
+  EEG_processed  %>% dplyr::mutate(id = as.character(id))
+)
+
+# Load summary (SD and Actigraphy)
+# --- UPDATED PLOT B DATA PREP ---
+
+# 1. Load summary (SD and Actigraphy)
+processed_summary <- read_csv(here("Data", "processed", "actigraphy_vs_diary_summary.csv")) %>%
+  filter(variable == "TIB") %>%
+  mutate(
+    TIB    = mean / 60,
+    method = Source,
+    week   = as.character(week_label)
+  )
+
+# 2. Process EEG data 
+EEG_processed <- eeg_clean %>%
+  mutate(
+    TIB = as.numeric(`TIB (mins)`) / 60, 
+    id  = as.character(as.integer(Real_ID)), 
+    week = case_when(
+      Timepoint == "BSL" ~ "BSL",
+      Timepoint == "SRT" ~ "1",
+      TRUE ~ as.character(Timepoint)
+    ),
+    method = "EEG"
+  ) %>%
+  select(id, week, TIB, method)
+
+# 3. Create TIB_prescribed
+TIB_prescribed <- bed_times %>%
+  mutate(
+    TIB = as.numeric(difftime(rise_time_set, bed_time_set, units = "hours")),
+    method = "Prescribed",
+    week = as.character(week) 
+  ) %>%
+  select(id, week, TIB, method)
+
+# 4. Combine Raw Data (EXCLUDING ECG)
+TIB_raw_combined <- bind_rows(
+  TIB_prescribed %>% mutate(id = as.character(id)),
+  EEG_processed  %>% mutate(id = as.character(id))
+)
+
+plot_B <- ggplot() +
+  # A. Plot Raw Data (Prescribed, ECG, EEG)
+  stat_summary(data = TIB_raw_combined, 
+               aes(x = week, y = TIB, color = method, group = method, shape = method),
+               fun.data = mean_se, geom = "errorbar", width = 0.2, linewidth = 1) +
+  stat_summary(data = TIB_raw_combined, 
+               aes(x = week, y = TIB, color = method, group = method, shape = method),
+               fun = mean, geom = "point", size = 4) +
+  stat_summary(data = TIB_raw_combined, 
+               aes(x = week, y = TIB, color = method, group = method),
+               fun = mean, geom = "line", linewidth = 1) +
+  
+  # B. Plot Summary Data (Sleep Diary & Actigraphy)
+  geom_errorbar(data = processed_summary, 
+                aes(x = week, ymin = (mean-se)/60, ymax = (mean+se)/60, color = method), 
+                width = 0.2, linewidth = 1) +
+  geom_point(data = processed_summary, 
+             aes(x = week, y = TIB, color = method, shape = method), size = 4) +
+  geom_line(data = processed_summary, 
+            aes(x = week, y = TIB, color = method, group = method), linewidth = 1) +
+  
+  # C. Formatting & Scales
+  # C. Updated Formatting & Scales (Purple-Blue Palette)
+scale_color_manual(
+    values = c(
+      "Prescribed"  = "#00204d", 
+      "Sleep Diary" = "#31446b", 
+      "Actigraphy"  = "#666991", 
+      "EEG"         = "#d6bdde"  
+    )
+  ) +
+  scale_shape_manual(
+    values = c(
+      "Prescribed"  = 16, 
+      "Sleep Diary" = 17, 
+      "Actigraphy"  = 15, 
+      "EEG"         = 1   
+    )
+  ) +
+  scale_x_discrete(limits = c("BSL", "1", "2", "3", "4")) +
+  coord_cartesian(ylim = c(5, 10)) +
+  theme_bw() +
+  theme(
+    panel.grid       = element_blank(),
+    panel.border     = element_blank(),
+    axis.line        = element_line(color = "black"),
+    legend.position  = "top",
+    legend.title     = element_blank(),
+    axis.text        = element_text(color = "black", size = 10),
+    axis.title       = element_text(face = "bold")
+  ) +
+  labs(
+    x = "Study Week", 
+    y = "Time in Bed (Hours)"
+  )
+
+
+plot_B
+```
+
+# Plot C & D
+```{r}
+# Pivot for visualization
+adherence_long <- adherence_summary_df %>%
+  pivot_longer(
+    cols = contains("time_difference"),
+    names_to = c("time_of_day", "method"),
+    names_pattern = "time_difference_(.*)_(.*)",
+    values_to = "time_difference"
+  ) %>%
+  filter(time_difference <= 300) %>%
+  mutate(method = recode(method, "sleepdiary" = "Sleep Diary", "actigraphy" = "Actigraphy"))
+
+# 1. Prepare Plot B
+plot_C <- ggplot(adherence_long, aes(x = week, y = time_difference, color = time_of_day)) +
+  # Error bars and Mean points
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.2) +
+  stat_summary(fun = mean, geom = "point", size = 3) +
+  stat_summary(fun = mean, geom = "line", aes(group = time_of_day)) +
+  
+  # Reference Lines
+  geom_hline(yintercept = 0, linetype = "solid", alpha = 0.5) +
+  geom_hline(yintercept = c(-15, 15), linetype = "dashed", alpha = 0.5) +
+  
+  # Faceting
+  facet_wrap(~method) +
+  
+  # Scales & Legend Formatting
+  scale_color_manual(
+    values = c("#003f5c", "#bc5090"),
+    labels = c("bedtime" = "Bedtime", "risetime" = "Risetime") # Capitalize labels
+  ) +
+  
+  # Theme Customization
+  theme_bw() + # Start with a stable base
+  theme(
+    panel.grid.major = element_blank(), # Remove grids
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),     # Remove box
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black"),
+    strip.background = element_blank(), # Clean facet labels
+    strip.text = element_text(face = "bold", size = 11),
+    legend.title = element_blank(),     # Remove legend title
+    legend.position = "right",
+    axis.text = element_text(color = "black")
+  ) +
+  
+  # Labels
+  labs(
+    y = "Difference from Prescribed Time (Mins)", 
+    x = "Week"
+  )
+
+# To view it:
+ plot_C
+ 
+ # 1. Prepare Plot D (Daily Adherence)
+plot_D <- ggplot(adherence_long, aes(x = day, y = time_difference, color = time_of_day)) +
+  # Use stat_summary to get the mean/SE for each specific day
+  stat_summary(fun.data = mean_se, geom = "errorbar", width = 0.3) +
+  stat_summary(fun = mean, geom = "point", size = 2) +
+  stat_summary(fun = mean, geom = "line", aes(group = time_of_day), linewidth = 0.8) +
+  
+  # Reference Lines (0, +/- 15 mins)
+  geom_hline(yintercept = 0, linetype = "solid", alpha = 0.5) +
+  geom_hline(yintercept = c(-15, 15), linetype = "dashed", alpha = 0.5) +
+  
+  # Faceting by Method
+  facet_wrap(~method) +
+  
+  # Scales & Legend
+  scale_color_manual(
+    values = c("#003f5c", "#bc5090"),
+    labels = c("bedtime" = "Bedtime", "risetime" = "Risetime")
+  ) +
+  # Adjust x-axis breaks based on your study length (e.g., every 5 days)
+  scale_x_continuous(breaks = seq(0, max(adherence_long$day, na.rm = TRUE), by = 5)) +
+  
+  # Theme Customization (Matching your no-grid style)
+  theme_bw() + 
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(color = "black"),
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 11),
+    legend.title = element_blank(),
+    legend.position = "bottom", # Moved to bottom to save horizontal space
+    axis.text = element_text(color = "black")
+  ) +
+  
+  # Labels
+  labs(
+    y = "Difference from Prescribed Time (Mins)", 
+    x = "Study Day"
+  )
+
+
+plot_D
+ 
+```
+
+# Combine Plots
+```{r, fig.width=17, fig.height=10}
+library(patchwork)
+
+# 1. Standardize Theme & Legend Positions for 2x2 Layout
+# Moving all legends to the bottom helps maintain a consistent plotting area width
+plot_A_final <- plot_A + theme(legend.position = "bottom", plot.margin = margin(5,5,5,5))
+plot_B_final <- plot_B + theme(legend.position = "bottom", plot.margin = margin(5,5,5,5))
+plot_C_final <- plot_C + theme(legend.position = "bottom", plot.margin = margin(5,5,5,5))
+plot_D_final <- plot_D + theme(legend.position = "bottom", plot.margin = margin(5,5,5,5))
+
+# 2. Combine into 2x2 Grid
+# (A + B) creates the top row
+# (C + D) creates the bottom row
+# ncol = 2 forces the two-column structure
+final_quad_plot <- (plot_A_final + plot_B_final) / (plot_C_final + plot_D_final) + 
+  plot_annotation(
+    tag_levels = 'A'
+  )
+
+# To view in your IDE:
+ final_quad_plot
+ 
+ # 1. Create the directory if it doesn't exist yet (Safety Step)
+if (!dir.exists(here("Figures", "Adherence"))) {
+  dir.create(here("Figures", "Adherence"), recursive = TRUE)
+}
+
+# 2. Save the Final Quad Plot to the specific folder
+ggsave(
+  filename = here("Figures", "Adherence", "Figure S1.jpg"), 
+  plot = final_quad_plot,
+  width = 17, 
+  height = 11, 
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = here::here("Figures", "Adherence", "Figure S1.tiff"), 
+  plot = final_quad_plot,
+  width = 17, 
+  height = 11, 
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+# 3. Print confirmation of the exact path
+cat("File successfully saved to:", here("Output", "adherence", "Figure S1.jpg"))
+```
+
+
