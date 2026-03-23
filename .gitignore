@@ -3,6 +3,7 @@ Data/
 *.csv
 *.txt
 *.xlsx
+*.xls
 *.rds
 *.edf
 *.set
