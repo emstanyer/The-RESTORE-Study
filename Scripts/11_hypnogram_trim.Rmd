@@ -1,0 +1,147 @@
+---
+title: "Unified Hypnogram Trimmer"
+author: "Emily Stanyer"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    df_print: paged
+params:
+  input_dir: "Data/raw/EEG/hypnograms_txt"
+  trim_mode: "N2N3"                   # OPTIONS: "REM" or "N2N3"
+  file_glob: "*.txt"
+  has_header: FALSE
+  delimiter: "\t"
+  artifact_stage_code: 6
+---
+
+# 1 Configuration
+
+```{r setup, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(purrr)
+library(fs)
+library(tools)
+library(here) # Essential for root-finding
+
+# 1. FORCE THE KNIT ROOT (Ensures everything stays in the Project Root)
+knitr::opts_knit$set(root.dir = here::here())
+
+# 2. SET TARGETS AND PATHS (Anchored with here())
+if (params$trim_mode == "REM") {
+  TARGET_STAGES <- c(5)
+  suffix <- "_REM"
+  # Use here() to ensure this folder is created at the top level of your project
+  out_dir <- here::here("Data/processed/EEG/hypnograms_trimmed_REM")
+} else {
+  TARGET_STAGES <- c(2, 3)
+  suffix <- "_N2N3"
+  out_dir <- here::here("Data/processed/EEG/hypnograms_trimmed_NREM")
+}
+
+# Create folder at the project root level
+dir_create(out_dir)
+
+# 3. LOAD FILES
+# Ensure your input_dir is also anchored to the root
+input_path <- here::here(params$input_dir)
+files <- list.files(input_path, pattern = "\\.txt$", full.names = TRUE) %>% sort()
+
+# Check if files exist to avoid silent failures
+if (length(files) == 0) stop("No .txt files found in: ", input_path)
+
+read_hyp <- function(path) {
+  nm <- c("stage", "exclude")
+  df <- suppressMessages(read_delim(path, delim = params$delimiter, 
+                                    col_names = if(params$has_header) TRUE else nm,
+                                    col_types = "ii"))
+  if (!params$has_header) names(df) <- nm
+  df %>% mutate(row_id = row_number(), file = basename(path),
+                exclude = if_else(stage == params$artifact_stage_code, 1L, exclude))
+}
+all_hyps <- files %>% map(read_hyp)
+
+# 4. CALCULATE COUNTS
+stats <- map_dfr(all_hyps, function(df) {
+  df %>% summarise(
+    file = first(file),
+    rem_count = sum(stage == 5 & exclude == 0, na.rm = TRUE),
+    n2n3_count = sum(stage %in% c(2,3) & exclude == 0, na.rm = TRUE),
+    total_rows_orig = n()
+  )
+})
+
+# 5. SELECT COMMON N BASED ON MODE
+if (params$trim_mode == "REM") {
+  sorted_rem <- sort(stats$rem_count)
+  common_N <- if(length(sorted_rem) >= 2) sorted_rem[2] else sorted_rem[1]
+  cat("Mode: REM (Using 2nd lowest value)\n")
+} else {
+  common_N <- min(stats$n2n3_count)
+  cat("Mode: N2N3 (Using absolute minimum value)\n")
+}
+
+cat("Common N being used for trimming: ", common_N, "\n")
+```
+
+# This report reads all hypnogram text files in `params$input_dir`, finds the maximum number of valid, artefact-free **REM** epochs common to all files (Stage 5), and then keeps only the first **N** such epochs per file while marking all other epochs as excluded (second column = 1). Pre-existing exclusions are preserved and never undone.
+
+# **Codes assumed** 
+$0=$ Wake, $1=N1$, $2=N2$, $3=N3$, $5=$ REM, $6=$ Artefact
+
+
+```{r}
+  process_and_write <- function(df, keep_N, target_vals, output_path, label) {
+  df2 <- df %>% mutate(is_valid_target = (exclude == 0L & stage %in% target_vals))
+  
+  # Check if this specific file has enough epochs to meet common_N
+  available_epochs <- sum(df2$is_valid_target)
+  
+  if (available_epochs < keep_N) {
+    message(paste("!!! SKIPPING FILE:", unique(df$file), "- Only has", available_epochs, "epochs, needs", keep_N))
+    return(NULL)
+  }
+
+  # Find indices of first N epochs
+  keep_idx <- which(df2$is_valid_target) %>% head(keep_N)
+  
+  # Update exclusion: 0 for kept epochs, 1 for EVERYTHING else
+  df_out <- df2 %>% 
+    mutate(exclude = if_else(row_id %in% keep_idx, 0L, 1L)) %>% 
+    select(stage, exclude)
+  
+  new_filename <- paste0(file_path_sans_ext(unique(df$file)), label, ".txt")
+  write_delim(df_out, file.path(output_path, new_filename), delim = params$delimiter, col_names = FALSE)
+  
+  tibble(file = unique(df$file), 
+         n_zeros_new = sum(df_out$exclude == 0), 
+         total_rows_new = nrow(df_out))
+}
+
+trim_log <- map_dfr(all_hyps, ~process_and_write(.x, common_N, TARGET_STAGES, out_dir, suffix))
+```
+  
+# 3 Validation Check
+```{r validation}
+if (nrow(trim_log) > 0) {
+  validation_summary <- stats %>%
+    inner_join(trim_log, by = "file") %>%
+    mutate(rows_match = total_rows_orig == total_rows_new,
+           target_met = n_zeros_new == common_N)
+  
+  validation_summary
+} else {
+  cat("No files were processed.")
+}
+```
+* **REM definition:** Defaults to Stage 5 (`params$rem_stages: [5]`).
+* **Artefacts:** Any row with stage code `params$artifact_stage_code` is forced to excluded (1) regardless of the provided flag.
+* **Safety:** The script writes new files to `params$output_dir` (folder `hypnograms_trimmed_REM`) and appends `_REM` to filenames. It does not modify originals.
+* **Summary exports:** `rem_counts_summary.csv` and `trim_log_rem.csv` are written into the output folder for traceability.
+
+# 7 Session info
+
+```{r session_info}
+sessionInfo()
+```
