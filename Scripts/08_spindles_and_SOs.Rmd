@@ -1,0 +1,324 @@
+---
+title: "Combined Sleep Spindle & Slow Oscillation Analysis"
+author: "Dr Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+params:
+  # ---- INPUTS ----
+  spindle_file: "Data/raw/EEG/spindles/spindle_data.csv"
+  so_dir: "Data/raw/EEG/SOs"
+  blinding_file: "Data/raw/EEG/blinding_files/unblinding_spectral.csv"
+  out_dir: "Output/EEG/SOs_spindles"
+  fig_dir: "Figures/EEG/SOs_spindles"
+---
+
+# Setup parameters
+```{r setup, include=FALSE}
+# Setup parameters
+# 1. FORCE THE KNIT ROOT (Crucial for the 'Knit' button)
+knitr::opts_knit$set(root.dir = here::here())
+
+# 2. Standard options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# 3. Load Libraries
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(tidyr)
+  library(lubridate)
+  library(stringr)
+  library(ggplot2)
+  library(flextable)
+  library(officer)
+  library(lmerTest)
+  library(emmeans)
+  library(here) # Essential for root-finding
+  library(fs)   # Cleaner folder management
+})
+
+# 4. Create Output Directory (Anchored to Root)
+# This prevents "Output/" from being created inside your markdown folder
+out_dir <- here::here(params$out_dir)
+
+# fs::dir_create is safer and handles 'recursive' automatically
+if (!fs::dir_exists(out_dir)) fs::dir_create(out_dir)
+
+# 5. Variable definitions
+spindle_vars <- c(
+  "count",
+  "density_per_epoch"
+)
+```
+
+# LMM function
+```{r, standard-LMM}
+# Standard function to run LMM and get publication-ready stats
+run_sleep_analysis <- function(df, value_col, metric_label) {
+  
+  # 1. Aggregate to night level first
+  dat <- df %>%
+    dplyr::group_by(ParticipantID, Timepoint) %>%
+    dplyr::summarise(value = mean(.data[[value_col]], na.rm = TRUE), .groups = "drop") %>%
+    dplyr::filter(!is.na(value)) %>%
+    droplevels()
+
+  # FIX: Calculate overall n for this specific metric
+  total_n <- dplyr::n_distinct(dat$ParticipantID)
+
+  # 2. Run Linear Mixed Model
+  fit <- lmerTest::lmer(value ~ Timepoint + (1|ParticipantID), data = dat)
+  emm <- emmeans::emmeans(fit, "Timepoint")
+  
+  # 3. Contrasts vs Baseline
+  ctr <- summary(emmeans::contrast(emm, method = "trt.vs.ctrl", ref = 1), 
+                 infer = c(TRUE, TRUE), adjust = "holm") %>% as.data.frame()
+  
+  # 4. Cohen's d
+  s_val <- sigma(fit)
+  edf_val <- df.residual(fit) 
+  d_grid <- emmeans::eff_size(emm, method = "trt.vs.ctrl", ref = 1, sigma = s_val, edf = edf_val)
+  d_sum <- summary(d_grid) %>% as.data.frame() %>% dplyr::select(contrast, d = effect.size)
+  
+  # 5. Summary Stats (Mean/SD)
+  stats <- dat %>%
+    dplyr::group_by(Timepoint) %>%
+    dplyr::summarise(mn = mean(value), sd = sd(value), .groups = "drop")
+  
+  # 6. Clean and Combine
+  ctr <- ctr %>% dplyr::mutate(Timepoint = stringr::str_remove(contrast, " - BSL| - Baseline"))
+  d_sum <- d_sum %>% dplyr::mutate(Timepoint = stringr::str_remove(contrast, " - BSL| - Baseline"))
+  
+  stats %>%
+    dplyr::left_join(ctr, by = "Timepoint") %>%
+    dplyr::left_join(d_sum, by = "Timepoint") %>%
+    # FIX: Add metric_n here so the table can see it
+    dplyr::mutate(metric = metric_label, metric_n = total_n)
+}
+```
+
+#  Read in spindles and SOs
+```{r, read-in-files}
+# --- 1. Helper Function for Timepoint Logic ---
+# This avoids writing the case_when logic twice
+apply_timepoint_logic <- function(df) {
+  df %>%
+    dplyr::mutate(
+      # Extract date and participant info from the filename linked during the join
+      base      = basename(original_filename),
+      date_str  = stringr::str_extract(base, "\\d{4}_\\d{2}_\\d{2}"),
+      Date      = lubridate::ymd(stringr::str_replace_all(date_str, "_", "-")),
+      
+      # Determine Timepoint (BSL, SRT, FU)
+      tp_raw    = stringr::str_extract(base, "(?i)BSL|FU|FLW|INT|SRT_NIGHT"),
+      Timepoint = dplyr::case_when(
+        stringr::str_detect(tp_raw, "(?i)BSL") ~ "BSL",
+        stringr::str_detect(tp_raw, "(?i)FU|FLW") ~ "FU",
+        stringr::str_detect(tp_raw, "(?i)INT|SRT_NIGHT") ~ "SRT",
+        TRUE ~ "Unknown"
+      )
+    ) %>%
+    # Calculate SRT Day numbers
+    dplyr::group_by(ParticipantID) %>%
+    dplyr::mutate(
+      first_srt    = suppressWarnings(min(Date[Timepoint == "SRT"], na.rm = TRUE)),
+      DayWithinSRT = dplyr::if_else(Timepoint == "SRT", 
+                                    as.integer(Date - first_srt) + 1L, NA_integer_)
+    ) %>%
+    dplyr::ungroup() %>%
+    # Final Labeling
+    dplyr::mutate(
+      Timepoint = dplyr::case_when(
+        Timepoint == "SRT" & !is.na(DayWithinSRT) & DayWithinSRT <= 7 ~ paste0("Day ", DayWithinSRT),
+        Timepoint == "SRT" & !is.na(DayWithinSRT) & DayWithinSRT > 7  ~ "Day 7+",
+        TRUE ~ as.character(Timepoint)
+      ),
+      Timepoint = factor(Timepoint, levels = c("BSL", paste0("Day ", 1:7), "Day 7+", "FU"))
+    )
+}
+
+# --- 2. Load Blinding Key ---
+blinding_key <- readr::read_csv(here::here(params$blinding_file), show_col_types = FALSE) %>%
+  dplyr::mutate(
+    spisop_id = as.integer(spisop_id),
+    # Ensure ParticipantID is extracted for linking
+    Real_ID = stringr::str_extract(basename(original_filename), "^[0-9]+")
+  )
+
+# --- 3. Process Spindles ---
+spindle_raw <- readr::read_csv(here::here(params$spindle_file), show_col_types = FALSE)
+
+spindle_unblinded <- spindle_raw %>%
+  dplyr::inner_join(blinding_key, by = c("datasetnum" = "spisop_id")) %>%
+  dplyr::rename(ParticipantID = Real_ID) %>%
+  apply_timepoint_logic()
+
+# --- 4. Process SOs ---
+so_files <- list.files(here::here(params$so_dir), pattern = "\\.csv$", full.names = TRUE)
+
+so_raw <- purrr::map_dfr(so_files, function(path) {
+  readr::read_csv(path, show_col_types = FALSE) %>% 
+    dplyr::mutate(ID = as.integer(stringr::str_extract(basename(path), "\\d+")))
+})
+
+so_unblinded <- so_raw %>%
+  dplyr::inner_join(blinding_key, by = c("ID" = "spisop_id")) %>%
+  dplyr::rename(ParticipantID = Real_ID) %>%
+  apply_timepoint_logic()
+
+# --- 5. Final Diagnostic Check ---
+message("Spindle Unique Nights: ", nrow(distinct(spindle_unblinded, ParticipantID, Timepoint)))
+message("SO Unique Nights: ", nrow(distinct(so_unblinded, ParticipantID, Timepoint)))
+```
+
+# Export LMM results to word table
+```{r, run-lmm}
+
+library(flextable)
+library(officer)
+
+# --- 1. Run Analysis for All 4 Metrics ---
+# Spindles
+res_spin_cnt  <- run_sleep_analysis(spindle_unblinded, "count", "Spindle Count")
+res_spin_dens <- run_sleep_analysis(spindle_unblinded, "density_per_epoch", "Spindle Density")
+
+# Slow Oscillations
+res_so_cnt    <- run_sleep_analysis(so_unblinded, "count", "Slow Oscillation Count")
+res_so_dens   <- run_sleep_analysis(so_unblinded, "density_per_epoch", "Slow Oscillation Density")
+
+# --- 2. Combine and Format ---
+# We bind them in the specific order you listed
+all_metrics_results <- dplyr::bind_rows(res_spin_cnt, res_spin_dens, res_so_cnt, res_so_dens) %>%
+  dplyr::mutate(
+    # Create bold-ready headers with n
+    metric_with_n = sprintf("%s (n = %d)", metric, metric_n),
+    # Clean timepoint labels
+    Timepoint = dplyr::recode(as.character(Timepoint), "BSL" = "Baseline", "FU" = "Follow up"),
+    # Force 2 decimal places for all stats
+    `Mean (SD)` = sprintf("%.2f (%.2f)", mn, sd),
+    Diff_adj    = ifelse(Timepoint == "Baseline", "-", sprintf("%.2f", estimate)),
+    `95% CI`    = ifelse(Timepoint == "Baseline", "-", sprintf("%.2f to %.2f", lower.CL, upper.CL)),
+    d           = ifelse(Timepoint == "Baseline", "-", sprintf("%.2f", d))
+  ) %>%
+  dplyr::select(metric_with_n, Timepoint, `Mean (SD)`, Diff_adj, `95% CI`, d)
+
+# --- 3. Create the Styled Flextable ---
+ft_master <- as_grouped_data(x = all_metrics_results, groups = "metric_with_n") %>%
+  as_flextable() %>%
+  set_header_labels(metric_with_n = "Timepoint", Timepoint = "Timepoint") %>%
+  bold(part = "header") %>%
+  # Bold the grouping headers (Metric + n)
+  bold(i = ~ !is.na(metric_with_n)) %>% 
+  # Indent the nights under each header
+  padding(i = ~ is.na(metric_with_n), j = 1, padding.left = 20) %>% 
+  # Clear the data columns on the header rows
+  compose(i = ~ !is.na(metric_with_n), j = 2:5, value = as_paragraph("")) %>% 
+  # Professional look
+  theme_booktabs() %>% 
+  align(align = "left", part = "all") %>%
+  autofit()
+
+# --- 4. Export to Word ---
+
+doc <- read_docx() %>%
+  body_add_par("Summary Statistics: Spindle and Slow Oscillation Metrics", style = "heading 1") %>%
+  body_add_flextable(ft_master)
+
+# Specify your final output path
+print(doc, target = file.path(out_dir, "SOs_spindles_LMM.docx"))
+
+message("Master table with 4 metrics successfully saved to Word.")
+```
+
+# Generate plots
+```{r plot spindles, fig.width=12, fig.height=7}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggprism)
+
+# --- 1. Setup the Directory using YAML params ---
+# This ensures it goes to "Figures/EEG/SOs_spindles" as requested in the YAML
+final_fig_path <- here::here(params$fig_dir)
+
+if (!dir.create(final_fig_path, recursive = TRUE, showWarnings = FALSE)) {
+  # This just ensures the folder actually exists on your Mac/PC
+}
+
+# 2. Define order of timepoints
+desired_levels <- c("BSL", paste0("Day ", 1:7), "FU")
+
+# 3. Prepare Spindle Data
+nights_sp_clean <- spindle_unblinded %>%
+  dplyr::filter(Timepoint %in% desired_levels) %>%
+  dplyr::mutate(Timepoint = factor(Timepoint, levels = desired_levels)) %>%
+  dplyr::group_by(ParticipantID, Timepoint) %>%
+  dplyr::summarise(across(c(count, density_per_epoch), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  dplyr::mutate(type = "Spindles")
+
+# 4. Prepare SO Data (using lowercase so_unblinded)
+nights_so_clean <- so_unblinded %>%
+  dplyr::filter(Timepoint %in% desired_levels) %>%
+  dplyr::mutate(Timepoint = factor(Timepoint, levels = desired_levels)) %>%
+  dplyr::group_by(ParticipantID, Timepoint) %>%
+  dplyr::summarise(across(c(count, density_per_epoch), ~ mean(.x, na.rm = TRUE)), .groups = "drop") %>%
+  dplyr::mutate(type = "Slow Oscillations")
+
+# 5. Combine and Pivot
+combined_plot_data <- dplyr::bind_rows(nights_sp_clean, nights_so_clean) %>%
+  tidyr::pivot_longer(cols = c(count, density_per_epoch), 
+                      names_to = "metric", values_to = "value") %>%
+  dplyr::mutate(
+    metric = dplyr::recode(metric, 
+                           "count" = "Count", 
+                           "density_per_epoch" = "Density per Epoch")
+  )
+
+# 6. Summary Stats
+combined_summary <- combined_plot_data %>%
+  dplyr::group_by(Timepoint, metric, type) %>%
+  dplyr::summarise(
+    mn = mean(value, na.rm = TRUE),
+    sd = stats::sd(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 7. Generate the 4-Panel Plot
+
+p_4panel <- ggplot() +
+  geom_point(data = combined_plot_data, aes(x = Timepoint, y = value, color = type),
+             alpha = 0.2, size = 1.2, position = position_jitter(width = 0.15)) +
+  geom_line(data = combined_summary, aes(x = Timepoint, y = mn, color = type, group = type), linewidth = 1) +
+  geom_point(data = combined_summary, aes(x = Timepoint, y = mn, color = type, shape = type), size = 3) +
+  geom_errorbar(data = combined_summary, aes(x = Timepoint, ymin = mn - sd, ymax = mn + sd, color = type),
+                width = 0.2, linewidth = 0.7) +
+  facet_wrap(metric ~ type, scales = "free_y", nrow = 2) +
+  scale_color_manual(values = c("Spindles" = "#2C3E50", "Slow Oscillations" = "#E74C3C")) +
+theme_classic()+
+  labs(x = NULL, y = "Value (Mean ± SD)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+ggplot2::ggsave(
+  filename = file.path(final_fig_path, "SOs_Spindles.png"), 
+  plot = p_4panel, 
+  width = 14, 
+  height = 10, 
+  dpi = 300,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = file.path(final_fig_path, "SOs_Spindles.jpg"), 
+  plot = p_4panel, 
+  width = 14, 
+  height = 10, 
+  dpi = 300
+)
+
+p_4panel
+```
+```
+
