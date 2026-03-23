@@ -1,0 +1,24 @@
+# --- DATA PRIVACY ---
+Data/
+Output/
+*.csv
+*.txt
+*.xlsx
+*.rds
+*.edf
+*.set
+*.fdt
+
+# --- R Internals ---
+.Rproj.user
+.Rhistory
+.RData
+.Renviron
+.Ruserdata
+renv/library/
+renv/python/
+renv/staging/
+
+# --- System Files ---
+.DS_Store
+Thumbs.db
