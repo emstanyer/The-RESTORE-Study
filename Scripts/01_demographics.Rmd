@@ -158,8 +158,15 @@ summary_table <- table_input %>%
   bold_labels()
 
 summary_table
- # save as word file to output directory
-save_as_docx(summary_table, path = here(params$out_dir, "demographics_summary_table.docx"))
+
+# 1. Convert to a 'gt' object 
+summary_gt <- summary_table %>% as_gt()
+
+gt::gtsave(
+  data = summary_gt,
+  filename = "demographics_summary_table.docx",
+  path = here::here("Output", "demographics")
+)
 
 ```
 
