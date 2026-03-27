@@ -930,7 +930,140 @@ ggsave(
 message("Success! Plot saved to: ", output_path)
 ```
 
+# Adaptation nights 
+```{r, fig.width=12, fig.height=20, warning=FALSE, message=FALSE}}
+# --- 1. SETUP HELPERS & MAPPINGS ---
 
+# Define the bridge between Adaptation (CAPS) and Clean (Pretty) names
+rename_map <- c(
+  "TIB (mins)"           = "TIB_DURATION",
+  "TST (mins)"           = "SLEEP_DURATION",
+  "Wake (mins)"          = "WAKE_DURATION",
+  "N1 (mins)"            = "STAGE1_DURATION",
+  "N2 (mins)"            = "STAGE2_DURATION",
+  "N3 (mins)"            = "STAGE3_DURATION",
+  "REM (mins)"           = "REM_DURATION",
+  "WASO (mins)"          = "WAKE_AFTER_SLEEP_ON",
+  "Sleep Efficiency (%)" = "SLEEP_EFFICIENCY",
+  "SOL (mins)"           = "SLEEPLATENCY",
+  "REM Latency (mins)"   = "REM_LATENCY",
+  "N3 Latency (mins)"    = "SLEEPLATENCY_DEEPSLEEP"
+)
+
+# List of duration variables to be converted to minutes
+duration_vars <- c("TIB_DURATION", "SLEEP_DURATION", "WAKE_DURATION", 
+                  "STAGE1_DURATION", "STAGE2_DURATION", "STAGE3_DURATION", 
+                  "REM_DURATION", "WAKE_AFTER_SLEEP_ON", "SLEEPLATENCY", 
+                  "REM_LATENCY", "SLEEPLATENCY_DEEPSLEEP")
+
+
+
+# Helper to handle duplicate columns
+dedup_cols <- function(df) {
+  colnames(df) <- make.unique(colnames(df))
+  df
+}
+
+# Custom loader for Adaptation files
+read_adapt_only <- function(f) {
+  df <- readxl::read_excel(f, skip = 1, col_types = "text") %>%
+    dedup_cols()
+  df$Real_ID <- stringr::str_extract(basename(f), "^\\d{3}")
+  df$day <- "AD"
+  return(df)
+}
+
+# --- 2. EXECUTE DATA PROCESSING ---
+
+library(tidyverse)
+library(lubridate)
+library(here)
+
+# Load AD files
+adapt_path <- here::here("Data", "raw", "EEG", "adaptation_night_sleep_profile")
+adapt_files <- list.files(adapt_path, pattern = "\\.xlsx$", full.names = TRUE)
+adapt_raw_df <- purrr::map_dfr(adapt_files, read_adapt_only)
+
+## 1. Improved Converter: Handles Excel Serial (0.05), Seconds (4000), and Minutes (70)
+convert_to_minutes_smart <- function(x) {
+  x_num <- as.numeric(as.character(x))
+  dplyr::case_when(
+    is.na(x_num) ~ NA_real_,
+    # If it's a tiny decimal (Excel serial), convert to minutes
+    x_num > 0 & x_num < 2 ~ x_num * 1440, 
+    # If it's a massive number (Seconds), convert to minutes
+    x_num > 1440 ~ x_num / 60,
+    # Otherwise, assume it's already in minutes
+    TRUE ~ x_num
+  )
+}
+
+# 2. Clean the AD side
+adapt_prep <- adapt_raw_df %>%
+  dplyr::rename(dplyr::any_of(rename_map)) %>%
+  # Apply the smart converter to every column except ID/Day
+  dplyr::mutate(across(-c(Real_ID, day), convert_to_minutes_smart)) %>%
+  dplyr::mutate(Real_ID = as.character(Real_ID), day = "AD")
+
+# 3. Clean the BSL/Study side 
+# This forces 'clean' to be numeric too, stopping the "Can't combine" error
+clean_prep <- clean %>%
+  dplyr::mutate(across(where(is.character) & !c(Real_ID, day), ~as.numeric(as.character(.x)))) %>%
+  dplyr::mutate(Real_ID = as.character(Real_ID), day = as.character(day))
+
+# 4. Bind them - Now they are both numeric and in the right units!
+full_timeline_df <- dplyr::bind_rows(adapt_prep, clean_prep) %>%
+  dplyr::mutate(day = factor(day, levels = c("AD", "BSL", "1", "2", "3", "4", "5", "6", "7", "FU")))
+
+# --- 3. PIVOT & PLOT ---
+
+full_long <- full_timeline_df %>%
+  dplyr::select(Real_ID, day, any_of(mins_plus_se)) %>%
+  # Force all metric columns to numeric
+  dplyr::mutate(across(-c(Real_ID, day), ~as.numeric(as.character(.x)))) %>%
+  tidyr::pivot_longer(
+    cols = -c(Real_ID, day), 
+    names_to = "variable", 
+    values_to = "value"
+  ) %>%
+  dplyr::filter(!is.na(value))
+
+full_summary <- full_long %>%
+  group_by(day, variable) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    se = sd(value, na.rm = TRUE) / sqrt(pmax(n(), 1)), 
+    .groups = "drop"
+  )
+
+p_full_timeline <- ggplot(full_summary, aes(x = day, y = mean, group = 1)) +
+  geom_line(linewidth = 0.8, color = "gray60", linetype = "dashed") +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2, color = "#2E4053") +
+  geom_point(size = 3, aes(color = (day == "AD")), shape = 16) +
+  scale_color_manual(values = c("TRUE" = "#E67E22", "FALSE" = "#2E4053")) +
+  facet_wrap(~ variable, scales = "free", ncol = 3) +
+  theme_classic() +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  ) +
+  labs(x = "Study Night", y = "Mean ± SE")
+
+## 1. Verify where 'here' thinks the root is
+print(paste("Project Root is:", here::here()))
+
+# 2. Save using the explicit path construction
+# This ensures it goes: Project Root -> Figures -> EEG -> Filename
+ggsave(
+  filename = here::here("Figures", "EEG", "EEG_with_adaptation_night.png"), 
+  plot = p_full_timeline, 
+  width = 15, 
+  height = 9,
+  dpi = 300
+)
+```
 
 
 # Session info
