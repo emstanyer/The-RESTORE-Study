@@ -1065,6 +1065,103 @@ ggsave(
 )
 ```
 
+# SOREMPS
+```{r}
+# 1. PREPARE THE DATA
+soremp_clean <- full_timeline_df %>%
+  select(Real_ID, day, `REM Latency (mins)`) %>%
+  mutate(
+    rem_val = as.numeric(`REM Latency (mins)`),
+    # Define SOREMP: REM within 15 minutes of sleep onset
+    is_soremp = rem_val <= 15,
+    soremp_label = if_else(is_soremp, "SOREMP (≤15m)", "Normal (>15m)")
+  ) %>%
+  # Filter out any NAs just in case, though you mentioned they all have REM
+  filter(!is.na(rem_val))
+
+# 2. PLOT BY PARTICIPANT (To see individual drivers)
+ggplot(soremp_clean, aes(x = day, y = 1, fill = soremp_label)) +
+  geom_tile(color = "white", linewidth = 0.5) + # Heatmap style tiles
+  facet_wrap(~ Real_ID, ncol = 3) +              # One small plot per participant
+  scale_fill_manual(values = c("SOREMP (≤15m)" = "#d95f0e", "Normal (>15m)" = "#2E4053")) +
+  theme_minimal() +
+  labs(
+    title = "Individual SOREMP Occurrences across Study Nights",
+    subtitle = "Orange tiles indicate REM onset within 15 minutes",
+    x = "Study Night",
+    y = NULL,
+    fill = "Status"
+  ) +
+  theme(
+    axis.text.y = element_blank(), # Hide Y axis since it's just a presence tile
+    axis.ticks.y = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom"
+  )
+
+# 3. SAVE INDIVIDUAL TRACKER
+ggsave(
+  filename = here::here("Figures", "EEG", "SOREMP_Individual_Tracker.png"),
+  width = 12, 
+  height = 8, 
+  dpi = 300
+)
+
+# 1. CREATE ANONYMOUS MAPPING
+# This creates a lookup table: Real_ID "101" -> "Participant A"
+id_mapping <- full_timeline_df %>%
+  distinct(Real_ID) %>%
+  arrange(Real_ID) %>%
+  mutate(
+    anon_id = paste("Participant", LETTERS[row_number()])
+  )
+
+# 2. PREPARE DATA WITH ANONYMOUS LABELS
+soremp_anon <- full_timeline_df %>%
+  left_join(id_mapping, by = "Real_ID") %>%
+  select(anon_id, day, `REM Latency (mins)`) %>%
+  mutate(
+    rem_val = as.numeric(`REM Latency (mins)`),
+    is_soremp = rem_val <= 15,
+    soremp_label = if_else(is_soremp, "SOREMP (≤15m)", "REM Latency (>15m)")
+  ) %>%
+  filter(!is.na(rem_val))
+
+# 3. PLOT ANONYMIZED FACETS
+ggplot(soremp_anon, aes(x = day, y = 1, fill = soremp_label)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  facet_wrap(~ anon_id, ncol = 4) + # Grouped by letter A, B, C...
+  scale_fill_manual(
+    values = c("SOREMP (≤15m)" = "#d95f0e", "REM Latency (>15m)" = "#2E4053"),
+    name = "Status"
+  ) +
+  theme_minimal() +
+  labs(
+  
+    x = "Study Night",
+    y = NULL
+  ) +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "bottom",
+    strip.background = element_rect(fill = "#f0f0f0", color = NA)
+  )
+
+# 4. SAVE
+ggsave(
+  filename = here::here("Figures", "EEG", "SOREMs.png"),
+  width = 10, 
+  height = 6, 
+  dpi = 300
+)
+```
+
 
 # Session info
 ```{r session-info}
