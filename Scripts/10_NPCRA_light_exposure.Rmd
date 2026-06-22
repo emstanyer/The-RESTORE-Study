@@ -1,0 +1,2032 @@
+---
+title: "RESTORE NPCRA & Light Analysis"
+author: "Emily Stanyer"
+date: "`r Sys.Date()`"
+output:
+ html_document:
+    theme: lumen
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: hide    
+---
+
+This code calculates standard non-parametric circadian rest-activity (NPCRA) and light exposure metrics using a combination of custom scripting and package functions (***LightLogR***, ***suncalc***) on raw light/activity data exported from Motionware, captured with the MotionWatch8. The data have previously been scored by the researcher for periods of "participant-defined" watch-off, or visually-identified gaps of >3 hours, and sleep periods following a standardised analysis protocol. This is not mandatory but helps with the identification of watch-off periods and if you would like to compute any variables specifically in the sleep period or wake period. Although, I have added a sleep-wake detection algorithm so it is possible to just use this on the raw .csv output from Motionware. If you do not score the files, you will need to identify watch-off periods in some other way e.g. by looking for long gaps in the data, or by using the activity column to identify periods of non-wear. You can then apply the imputation function to fill in these gaps with typical values based on the time of day and week.
+
+Also note that when I scored the files I applied Daylight Savings Time correction to all files where it was necessary.
+
+
+# R Setup Chunk
+Load the required R packages and define input, output, and figure directories.
+```{r, setup, include=FALSE, warning=FALSE}
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE   
+)
+
+# Load Required Packages
+library(tidyverse)
+library(here)
+library(lubridate)
+library(hms)
+library(readxl)
+library(circular)
+library(LightLogR)
+library(slider)
+library(flextable)
+library(suncalc)
+library(officer)
+
+# Define Directories
+output_dir <- here("Output", "Light")
+figures_dir <- here("Figures", "Light")
+if(!dir.exists(output_dir)) dir.create(output_dir)
+if(!dir.exists(figures_dir)) dir.create(figures_dir)
+
+sessionInfo()
+```
+
+# Helper Functions
+This section includes useful functions such as a circular mean and standard deviation (SD) for clock times and a time formatting function to convert seconds to HH:MM. It also contains the log transformation and back-transformation functions.
+```{r, helper-functions}
+# 1. Circular Mean for clock time (B10/D5/M10/L5)
+circular_mean_hours <- function(hours) {
+  if (all(is.na(hours))) return(NA_real_)
+  res <- as.numeric(circular::mean.circular(
+    circular::circular(hours, units = "hours", template = "clock24"), 
+    na.rm = TRUE
+  ))
+  if (res < 0) res <- res + 24
+  return(res)
+}
+
+# 2. Circular SD for clock time
+circular_sd_hours <- function(hours) {
+  if (all(is.na(hours))) return(NA_real_)
+  as.numeric(circular::sd.circular(
+    circular::circular(hours, units = "hours", template = "clock24"), 
+    na.rm = TRUE
+  ))
+}
+
+# 3. Time formatting (Seconds to HH:MM)
+format_seconds_to_hhmm <- Vectorize(function(seconds) {
+  if (is.na(seconds)) return("")
+  td <- lubridate::seconds_to_period(round(seconds))
+  sprintf("%02d:%02d", lubridate::hour(td), lubridate::minute(td))
+})
+
+# 4. Zero-inflated log/exp for geometric mean light logic
+log_zero_inflated <- function(x) log(x + 1)
+exp_zero_inflated <- function(x) exp(x) - 1
+
+# 1. Natural Photoperiod using SunCalc
+get_natural_photoperiod <- function(date, lat = 51.7520, lon = -1.2577) {
+  # sunrise and sunset times for the specific date and location
+  sun_times <- suncalc::getSunlightTimes(
+    date = date, 
+    lat = lat, 
+    lon = lon, 
+    keep = c("sunrise", "sunset"), 
+    tz = "GMT"
+  )
+  # Calculate duration in minutes
+  as.numeric(difftime(sun_times$sunset, sun_times$sunrise, units = "mins"))
+}
+```
+
+# Imputation Function
+This function fills gaps in both light and activity columns by calculating a Time-of-Day (TOD) median. Note that the same gaps were identified across light and activity in this process (i.e. gap cleaning occurred once manually). It identifies every minute of the week (0-1439), finds the median value for that specific minute from all other valid days in the same week, and uses that "typical" value to replace the "watch-off" gaps. 
+```{r,imputation-functions}
+.to_num <- function(x) suppressWarnings(as.numeric(x))
+
+safe_median <- function(x) {
+  x <- .to_num(x); x <- x[is.finite(x)]
+  if (!length(x)) return(NA_real_)
+  stats::median(x)
+}
+
+normalize_bool <- function(x) {
+  if (is.logical(x)) return(x)
+  if (is.factor(x))  x <- as.character(x)
+  if (is.numeric(x) || is.integer(x)) return(ifelse(is.na(x), NA, x != 0))
+  if (is.character(x)) {
+    z <- tolower(trimws(x))
+    return(dplyr::case_when(
+      z %in% c("1","true","t","yes","y") ~ TRUE,
+      z %in% c("0","false","f","no","n") ~ FALSE,
+      TRUE ~ NA
+    ))
+  }
+  rep(NA, length(x))
+}
+
+build_tod_medians <- function(df, week_col, tod_col, value_col, eligible_col, offwrist_col = NULL, use_offwrist = FALSE) {
+  elig  <- (!is.na(df[[eligible_col]])) & (df[[eligible_col]] == TRUE)
+  vals   <- .to_num(df[[value_col]])
+  donors <- elig & is.finite(vals)
+  
+  med <- df |>
+    dplyr::filter(donors) |>
+    dplyr::transmute(
+      WeekIndex = as.integer(.data[[week_col]]),
+      TOD_min   = as.integer(.data[[tod_col]]),
+      value     = .to_num(.data[[value_col]])
+    ) |>
+    dplyr::group_by(.data$WeekIndex, .data$TOD_min) |>
+    dplyr::summarise(TOD_med = safe_median(.data$value), .groups = "drop")
+  return(med)
+}
+
+apply_tod_impute <- function(df, week_col, tod_col, value_col, eligible_col, med_tbl, out_col) {
+  by_map <- setNames(c("WeekIndex", "TOD_min"), c(week_col, tod_col))
+  out_df <- df |> dplyr::left_join(med_tbl, by = by_map)
+  
+  elig <- (!is.na(out_df[[eligible_col]])) & (out_df[[eligible_col]] == TRUE)
+  val  <- .to_num(out_df[[value_col]])
+  med  <- .to_num(out_df[["TOD_med"]])
+  
+  out_df[[out_col]] <- ifelse(elig & is.finite(val), val,
+                       ifelse(elig & !is.finite(val) & is.finite(med), med, NA_real_))
+  out_df[["TOD_med"]] <- NULL
+  return(out_df)
+}
+
+npcra_impute_strict <- function(df, week_col, tod_col, value_col, eligible_col, out_col, fallback = "none") {
+  med_primary <- build_tod_medians(df, week_col, tod_col, value_col, eligible_col)
+  out_df <- apply_tod_impute(df, week_col, tod_col, value_col, eligible_col, med_primary, out_col)
+  
+  # QC Check
+  qc <- out_df |>
+    dplyr::group_by(.data[[week_col]]) |>
+    dplyr::summarise(
+      n_eligible = sum(.data[[eligible_col]] == TRUE),
+      n_filled = sum(!is.na(.data[[out_col]]) & .data[[eligible_col]] == TRUE),
+      coverage = n_filled / n_eligible
+    )
+  
+  return(list(data = out_df, qc = qc))
+}
+```
+
+# 1. Load and clean the raw actigraphy .csv files
+This code reads in the raw activity/light MotionWatch8 files exported from Motionware. It assigns all periods where the researcher has defined as "watch-off" (999999) to NA, so that the gaps are explicit. It counts the number of rows to ensure that the row length stays consistent. The code also converts the date and time columns from Excel format to a proper datetime column. It also changes the column names to those expected by the LightLogR package e.g. Datetime, Light, Id. It also assigns the correct timepoints and weeks to each row based on the filename and the date of recording. Finally, it saves the cleaned data to a new .csv file in the processed data directory for use in the next steps, or further analysis.
+```{r, 1-load-clean-data, message=FALSE, warning = FALSE}
+
+# LOAD REQUIRED PACKAGES
+library(tidyverse)
+library(readxl)
+library(hms)
+library(lubridate)
+
+# SET PATHS
+path_to_files <- here::here("Data/raw/actigraphy/")
+file_list <- list.files(path = path_to_files, pattern = "\\.xlsx$", full.names = TRUE)
+
+# FUNCTION TO READ AND PREP INDIVIDUAL FILES
+read_and_prep <- function(file) {
+  filename <- basename(file)
+  
+  # Extract metadata directly
+  p_id <- substr(filename, 1, 2)
+  tp   <- substr(filename, 4, 6)
+  
+  read_excel(file, sheet = 3) %>%
+    transmute(
+      id        = sprintf("%03d", as.numeric(p_id)),
+      Timepoint = tp,
+      Date      = as_date(Date),
+      Time      = as_hms(Time),
+      Datetime  = as_datetime(paste(Date, Time)),
+      light     = as.numeric(`Light (lux)`),
+      activity  = as.numeric(`Activity (MW counts)`)
+    )
+}
+
+# MAIN PIPELINE
+processed_data <- file_list %>%
+  map_dfr(read_and_prep) %>%
+  group_by(id, Timepoint) %>%
+  # Calculate Day relative to start of that specific timepoint
+  mutate(Day = as.numeric(Date - min(Date, na.rm = TRUE)) + 1) %>%
+  ungroup() %>%
+  # Filter based on timepoint constraints
+  filter(
+    (Timepoint == "BSL" & Day <= 14) | 
+    (Timepoint == "SRT" & Day <= 28)
+  ) %>%
+  # Assign weeks in one step
+  mutate(
+    week = case_when(
+      Timepoint == "BSL" ~ "BSL",
+      Timepoint == "SRT" ~ as.character(ceiling(Day / 7)),
+      TRUE               ~ NA_character_
+    )
+  )
+
+# Data Cleaning: Replace watch-off (999999) with explicit NAs
+rows_to_modify <- processed_data$activity == 999999
+processed_data$activity[rows_to_modify] <- NA
+processed_data$light[rows_to_modify] <- NA
+
+# Convert the Excel date/time formats and create the final Datetime column
+combined_data_clean <- processed_data%>%
+  mutate(
+    activity = as.numeric(activity),
+    light = as.numeric(light))
+
+#save to excel output directory as csv
+write_csv(combined_data_clean, here("Data", "processed", "light", "cleaned_light_data.csv"))
+  
+```
+
+# 2. Visualise the Data and Any Missing Data
+This analysis visualises light exposure and identifies data loss using a standardised temporal axis. By normalising each recording to Days from Start, we enable a direct comparison of monitoring duration across participants and timepoints. The following visualisation employs a logarithmic scale ($log_{10}$) to capture the wide dynamic range of light intensity, from dim nocturnal levels to bright daylight. Integrated "gap detection" logic identifies periods of missing data ($NA$ values) exceeding a 6-minute threshold ($0.1$ hours), which are highlighted as red background blocks to provide a visulisation of sensor reliability and recording continuity.
+```{r, 2-gap-visualisation, fig.width=10, fig.height=20}
+
+library(patchwork)
+library(tidyverse)
+
+## 1. Filter and prepare the data
+audit_final <- combined_data_clean %>%
+  filter(!is.na(Timepoint)) %>% 
+  mutate(id = factor(id), Timepoint = factor(Timepoint)) %>% 
+  group_by(id, Timepoint) %>%
+  mutate(
+    Start_Time = min(Datetime, na.rm = TRUE),
+    # Changed units to "days"
+    Days_From_Start = as.numeric(difftime(Datetime, Start_Time, units = "days"))
+  ) %>%
+  ungroup()
+
+# 2. Extract Red Gap Data
+red_gaps_master <- audit_final %>%
+  filter(is.na(light)) %>%
+  # We adjust the gap threshold: 0.1 hours is ~0.00417 days
+  group_by(id, Timepoint, grp = cumsum(c(1, diff(Days_From_Start) > (0.1/24)))) %>% 
+  summarise(start = min(Days_From_Start), end = max(Days_From_Start), .groups = "drop")
+
+# 1. Map original IDs to Letters A-Q
+unique_ids <- unique(audit_final$id)
+
+id_lookup <- tibble(
+  id = unique_ids,
+  # This creates "ID A", "ID B", etc.
+  masked_id = factor(paste(LETTERS[1:length(unique_ids)]),
+                     levels = paste(LETTERS[1:length(unique_ids)]))
+)
+
+# 2. Apply the mask to both datasets
+audit_masked <- audit_final %>%
+  left_join(id_lookup, by = "id")
+
+red_gaps_masked <- red_gaps_master %>%
+  left_join(id_lookup, by = "id")
+
+# --- Plot A: Light (Black, Log Scale) ---
+plot_light <- ggplot(audit_masked, aes(x = Days_From_Start)) +
+  geom_rect(data = red_gaps_masked, 
+            aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), 
+            fill = "red", alpha = 0.3, inherit.aes = FALSE) +
+  geom_line(aes(y = light), color = "black", linewidth = 0.2) +
+  scale_y_log10() +
+  facet_grid(masked_id ~ Timepoint, scales = "free_x") + 
+  theme_classic() +
+  labs(title = "A: Light Exposure", y = "Lux (Log10)", x = NULL) +
+  theme(
+    strip.text.y = element_text(angle = 0),
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# --- Plot B: Activity (Dark Blue, Adjusted Scale) ---
+plot_activity <- ggplot(audit_masked, aes(x = Days_From_Start)) +
+  geom_rect(data = red_gaps_masked, 
+            aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), 
+            fill = "red", alpha = 0.3, inherit.aes = FALSE) +
+  geom_line(aes(y = activity), color = "darkblue", linewidth = 0.2) +
+  # Using sqrt scale to "zoom in" on low activity while keeping peaks visible
+  scale_y_sqrt() + 
+  facet_grid(masked_id ~ Timepoint, scales = "free_x") + 
+  theme_classic() +
+  labs(title = "B: Activity Counts", y = "Counts (sqrt scale)", x = "Days from Start") +
+  theme(strip.text.y = element_text(angle = 0))
+
+# --- 2. Combine with Patchwork ---
+composite_audit <- (plot_light / plot_activity) + 
+  plot_layout(heights = c(1, 1)) +
+  plot_annotation(
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+composite_audit
+# --- 1. Define the Directory ---
+light_fig_dir <- here::here("Figures", "NPCRA_and_light")
+
+# Create the folder if it doesn't exist yet
+if (!dir.exists(light_fig_dir)) {
+  dir.create(light_fig_dir, recursive = TRUE)
+}
+
+# --- 2. Save the Figure ---
+# Saving as both PNG and TIFF for some journals
+ggsave(
+  filename = file.path(light_fig_dir, paste0("Light_Activity_Plot",  ".png")),
+  plot = composite_audit,
+  width = 18,
+  height = 20,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(light_fig_dir, paste0("Light_Activity_Plot",  ".tiff")),
+  plot = composite_audit,
+  width = 18,
+  height = 20,
+  units = "in",
+  dpi = 300,
+  compression = "lzw",
+  bg = "white"
+)
+
+cat("Success! Combined plots saved to:", light_fig_dir)
+```
+
+
+# 3. Quality Control
+This section evaluates the integrity of the light column data to ensure only high-quality recordings proceed to further analysis. It flags and excludes watch files based on two criteria: sensor covering (too dark for >80% of the time), or sensor malfunction/saturation (too bright for >75% of the time). This is based on the exclusions in [Burns et al. (2023)](https://doi.org/10.1038/s44220-023-00135-8).
+```{r, 3-qc-light, message=FALSE, warning=FALSE}
+# 1. Hardware QC (Sensor Integrity)
+qc_hardware <- combined_data_clean %>%
+  group_by(id, Timepoint) %>%
+  summarise(
+    n_valid_readings = sum(!is.na(light)),
+    pct_below_10 = (sum(light < 10, na.rm = TRUE) / n_valid_readings) * 100,
+    pct_above_6000 = (sum(light > 6000, na.rm = TRUE) / n_valid_readings) * 100,
+    Sensor_Exclusion = case_when(
+      pct_below_10 > 80   ~ "Too dark (>80% <10lx)",
+      pct_above_6000 > 75 ~ "Too bright (>75% >6000lx)",
+      TRUE ~ NA_character_
+    ), .groups = "drop"
+  )
+
+# 2. Protocol Validation (3-hour / 4-day rule)
+daily_validity <- combined_data_clean %>%
+  left_join(qc_hardware %>% select(id, Timepoint, Sensor_Exclusion), by = c("id", "Timepoint")) %>%
+  filter(is.na(Sensor_Exclusion)) %>% 
+  mutate(Date = as.Date(Datetime)) %>%
+  group_by(id, Timepoint, week, Date) %>%
+  summarise(
+    hours_missing = sum(is.na(light)) / 60,
+    is_day_valid = hours_missing < 3, 
+    .groups = "drop"
+  )
+
+week_validity <- daily_validity %>%
+  group_by(id, Timepoint, week) %>%
+  summarise(
+    valid_days_count = sum(is_day_valid),
+    is_week_valid = valid_days_count >= 4,
+    .groups = "drop"
+  )
+
+# 3. Create Registries
+daily_registry <- daily_validity %>%
+  left_join(week_validity, by = c("id", "Timepoint", "week")) %>%
+  filter(is_day_valid & is_week_valid) %>%
+  distinct(id, Timepoint, week, Date)
+# IS/IV Registry (Consecutive streaks for stability metrics)
+is_iv_registry <- daily_validity %>%
+  filter(is_day_valid) %>%
+  arrange(id, Timepoint, week, Date) %>%
+  group_by(id, Timepoint, week) %>%
+  mutate(is_streak = if(n() >= 4) {
+    slider::slide_lgl(Date, ~length(.x) == 4 && all(diff(.x) == 1), .before = 3, .complete = TRUE)
+  } else { FALSE }) %>%
+  mutate(keep = is_streak | lead(is_streak, 1, default=F) | lead(is_streak, 2, default=F) | lead(is_streak, 3, default=F)) %>%
+  filter(keep == TRUE) %>%
+  ungroup() %>%
+  distinct(id, Timepoint, week, Date)
+
+# 4. Final Filtered Dataset for Imputation
+combined_data_included_light <- combined_data_clean %>%
+  inner_join(daily_registry, by = c("id", "Timepoint", "week", "Date"))
+```
+
+
+# 4. Identify Missing Data, Select Valid Days and Weeks
+This section identifies irregularities and gaps in the light data to establish a valid dataset based on missingness. It begins by mapping missing data patterns by hour and participant for transparency. To ensure statistical reliability, the code applies a 3-hour missingness guard, flagging any day with more than three hours *total* of missing data for exclusion. Finally, it utilises a sliding window to enforce a 4-day consecutive streak rule, retaining only continuous blocks of light data. The 4 day consecutive rule is for IS/IV metrics only, whereas the 4 valid days (does not need to be consecutive) is for all other metrics. The process concludes with an automated exclusion and validation report that documents the reasons for any participant/data loss prior to final analysis. It also generates a heat map showing where the data are missing for each participant.
+```{r, 4-data-quality, message=FALSE, warning=FALSE, fig.width=12, fig.height=14}
+# 1. Summary Registry Stats
+light_streak_stats <- daily_validity %>%
+  filter(is_day_valid) %>%
+  group_by(id, week) %>%
+  summarise(
+    Total_Valid_Days = n(),
+    Longest_Streak = {
+      if(n() < 2) n() else {
+        runs <- rle(as.numeric(diff(Date)))
+        if(any(runs$values == 1)) max(runs$lengths[runs$values == 1]) + 1 else 1
+      }
+    }, .groups = "drop"
+  )
+
+# 2. Detailed Audit Table
+light_audit_ft <- daily_validity %>%
+  group_by(id, week) %>%
+  summarise(Avg_Gap = mean(hours_missing), .groups = "drop") %>%
+  left_join(light_streak_stats, by = c("id", "week")) %>%
+  mutate(Status = case_when(
+    Longest_Streak >= 4 ~ "✅ Kept (All Metrics)",
+    Total_Valid_Days >= 4 ~ "⚠️ Daily Only",
+    TRUE ~ "❌ Excluded"
+  )) %>%
+  flextable() %>% theme_vanilla() %>% autofit()
+
+htmltools::div(style = "height: 400px; overflow-y: scroll;", htmltools_value(light_audit_ft))
+
+# 3. Heatmap
+combined_data_included_light %>%
+  mutate(Time = hms::as_hms(Datetime), Date = as.Date(Datetime)) %>%
+  ggplot(aes(x = Time, y = Date)) +
+  geom_tile(aes(fill = log10(light + 1))) +
+  scale_fill_viridis_c(option = "plasma", na.value = "white") +
+  facet_wrap(~id, ncol = 5, scales = "free_y") +
+  theme_minimal() + labs(title = "Validated Data Heatmap")
+
+# --- 1. Helper Function for Inclusion Table ---
+get_phase_counts <- function(df, level_name) {
+  df %>%
+    mutate(Phase = ifelse(week == "BSL", "BSL", "SRT")) %>%
+    group_by(Phase) %>%
+    summarise(
+      Level = level_name,
+      Participants = n_distinct(id),
+      Weeks = n_distinct(id, week),
+      Valid_Days = n(),
+      .groups = "drop"
+    )
+}
+
+# --- 2. Calculate Attrition across Registries ---
+# Initial: Everything that passed the sensor integrity check
+initial_counts <- daily_validity %>% 
+  get_phase_counts("1. Post-Hardware QC")
+
+# Daily: Passed 3-hour guard AND 4-day week rule
+daily_counts <- daily_registry %>% 
+  get_phase_counts("2. Daily Metrics Registry")
+
+# IS/IV: Passed 3-hour guard AND 4-day consecutive streak rule
+is_iv_counts <- is_iv_registry %>% 
+  get_phase_counts("3. IS/IV (Strict) Registry")
+
+# --- 3. Render Inclusion Split Table ---
+inclusion_split_ft <- bind_rows(initial_counts, daily_counts, is_iv_counts) %>%
+  select(Level, Phase, Participants, Weeks, Valid_Days) %>%
+  flextable() %>%
+  set_header_labels(
+    Level = "Analysis Level",
+    Weeks = "Included Weeks",
+    Valid_Days = "Total Valid Days"
+  ) %>%
+  merge_v(j = "Level") %>% 
+  theme_vanilla() %>%
+  bg(i = ~ Phase == "BSL", bg = "#f9f9f9", part = "body") %>%
+  bold(i = ~ Level == "1. Post-Hardware QC", j = 1) %>%
+  autofit()
+
+# Display Table
+inclusion_split_ft
+
+# --- 4. Detailed Participant Audit (Scrollable) ---
+light_streak_stats <- daily_validity %>%
+  filter(is_day_valid) %>%
+  group_by(id, week) %>%
+  summarise(
+    Total_Valid = n(),
+    Longest_Streak = {
+      if(n() < 2) n() else {
+        runs <- rle(as.numeric(diff(Date)))
+        if(any(runs$values == 1)) max(runs$lengths[runs$values == 1]) + 1 else 1
+      }
+    }, .groups = "drop"
+  )
+
+light_audit_ft <- daily_validity %>%
+  group_by(id, week) %>%
+  summarise(Avg_Gap_Hrs = mean(hours_missing), .groups = "drop") %>%
+  left_join(light_streak_stats, by = c("id", "week")) %>%
+  mutate(Status = case_when(
+    Longest_Streak >= 4 ~ "✅ All Metrics",
+    Total_Valid >= 4    ~ "⚠️ Daily Only",
+    TRUE                ~ "❌ Excluded"
+  )) %>%
+  flextable() %>% theme_vanilla() %>% autofit()
+
+htmltools::div(style = "height: 400px; overflow-y: scroll; border: 1px solid #ddd;", 
+               htmltools_value(light_audit_ft))
+```
+
+# 5. Imputation Implementation
+This section takes the imputation function and applies it to our dataset. Note that both light and activity columns are imputed separately.
+```{r, 5-imputation}
+# --- 1. Filter to Valid Data Only ---
+# Only attempt to impute gaps in days that passed the 3-hour/4-day protocol
+final_imputed_all <- combined_data_clean %>%
+  mutate(Date = as.Date(Datetime)) %>%
+  inner_join(daily_registry, by = c("id", "Timepoint", "week", "Date")) %>%
+  mutate(TOD_min = hour(Datetime) * 60 + minute(Datetime))
+
+# --- 2. Calculate Medians (Donor Profiles) ---
+# Medians are calculated from 'clean' valid days only
+final_imputed_all <- final_imputed_all %>%
+  group_by(id, week, TOD_min) %>%
+  mutate(
+    weekly_med_light = median(light, na.rm = TRUE),
+    weekly_med_act   = median(activity, na.rm = TRUE)
+  ) %>%
+  group_by(id, TOD_min) %>%
+  mutate(
+    global_med_light = median(light, na.rm = TRUE),
+    global_med_act   = median(activity, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# --- 3. Execute Hierarchical Imputation ---
+# Keep real data -> Try Weekly Median -> Fallback to Global Median
+final_imputed_all <- final_imputed_all %>%
+  mutate(
+    light_imputed = case_when(
+      !is.na(light) ~ light,
+      !is.na(weekly_med_light) ~ weekly_med_light,
+      TRUE ~ global_med_light 
+    ),
+    activity_imputed = case_when(
+      !is.na(activity) ~ activity,
+      !is.na(weekly_med_act) ~ weekly_med_act,
+      TRUE ~ global_med_act
+    )
+  )
+
+final_imputed_all <- final_imputed_all %>%
+  filter(!(id == "001" & Timepoint == "SRT" & Date < (min(Date) + 7)))
+
+# --- 5. Final Verification ---
+na_check <- sum(is.na(final_imputed_all$light_imputed))
+cat(paste("Imputation complete. Remaining NAs in light_imputed:", na_check, "\n"))
+```
+
+# 6. Visualise The Impact of Imputation on Light
+Now we can plot the data again, but this time we can see that the red gaps are filled in. The heatmap still contains some white space. These are areas where the watch was not worn e.g. lead in time for a new watch given. Note again that this just shows us the light column, not the activity column.
+
+```{r, 6-plots, fig.width=12, fig.height=14}
+# --- 0. Create Anonymized Labels ---
+# Get unique IDs and assign them a letter (A, B, C...)
+unique_ids <- unique(final_imputed_all$id)
+id_lookup <- data.frame(
+  id = unique_ids,
+  anon_id = paste("Participant", LETTERS[seq_along(unique_ids)])
+)
+
+# Join the labels back to the main data
+final_imputed_anon <- final_imputed_all %>%
+  left_join(id_lookup, by = "id")
+
+# --- 1. Global Heatmap Audit 
+global_heatmap <- final_imputed_anon %>% 
+  mutate(Time = hms::as_hms(Datetime)) %>% 
+  ggplot(aes(x = Time, y = Date)) +
+  geom_tile(aes(fill = log10(light_imputed + 1))) +
+  scale_fill_viridis_c(option = "plasma", na.value = "white", name = "Log(Lux)") +
+  scale_x_time(breaks = scales::breaks_width("6 hours"), labels = scales::label_time("%H:%M")) +
+  # Use anon_id instead of id
+  facet_wrap(~anon_id, ncol = 5, scales = "free_y") +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 7),
+    strip.background = element_rect(fill = "gray95", color = NA),
+    strip.text = element_text(face = "bold", size = 8)
+  ) +
+  labs(
+       subtitle = "Anonymized Participant IDs (A-Z)",
+       x = "Time of Day (24h)", y = "Date")
+
+# --- 2. Sample Participant Verification 
+# We'll pick a random person our dataset
+sample_anon_id <- id_lookup$anon_id[id_lookup$id == "006"]
+
+sample_heatmap <- final_imputed_anon %>% 
+  filter(anon_id == sample_anon_id) %>% 
+  mutate(Time = hms::as_hms(Datetime)) %>%
+  tidyr::pivot_longer(
+    cols = c(light, light_imputed), 
+    names_to = "Status", 
+    values_to = "Lux_Value"
+  ) %>%
+  mutate(Status = factor(Status, 
+                         levels = c("light", "light_imputed"), 
+                         labels = c("Original (Pre-Imputation)", "Final (Post-Imputation)"))) %>%
+  ggplot(aes(x = Time, y = Date)) +
+  geom_tile(aes(fill = log10(Lux_Value + 1))) +
+  scale_fill_viridis_c(option = "plasma", na.value = "white", name = "Log(Lux)") +
+  scale_x_time(breaks = scales::breaks_width("6 hours"), labels = scales::label_time("%H:%M")) +
+  facet_wrap(~Status, ncol = 2) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(size = 8),
+    strip.background = element_rect(fill = "gray90", color = NA),
+    strip.text = element_text(face = "bold")
+  ) +
+  labs(
+       x = "Time of Day (24h)", y = "Date")
+
+# save plots
+# Saving as both PNG and TIFF for your records
+ggsave(
+  filename = file.path(light_fig_dir, paste0("Heatmap_Global",  ".jpg")),
+  plot = global_heatmap,
+  width = 10,
+  height = 16,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+ggsave(
+  filename = file.path(light_fig_dir, paste0("Heatmap_Sample",  ".jpg")),
+  plot = sample_heatmap,
+  width = 7,
+  height = 7,
+  units = "in",
+  dpi = 300,
+  bg = "white"
+)
+
+```
+
+# 9. Sleep period data
+```{r, 9-sleep-periods}
+# ==============================================================================
+# 10. ACTIGRAPHY PROCESSING: DATES & CLOCK-TIME CONVERSION
+# ==============================================================================
+library(tidyverse)
+library(readxl)
+library(here)
+library(hms)
+
+# --- 1. Load All Raw Files ---
+path_to_files <- here("Data", "raw", "actigraphy")
+file_list <- list.files(path = path_to_files, pattern = "\\.xlsx$", full.names = TRUE)
+
+if (length(file_list) == 0) stop("No .xlsx files found in the specified path.")
+
+data_list <- list()
+for (file in file_list) {
+  fname <- basename(file)
+  data <- read_excel(file, sheet = 1) %>%
+    mutate(id = substr(fname, 1, 2), 
+           Timepoint = substr(fname, 4, 6))
+  data_list[[fname]] <- data
+}
+
+# --- 2. Initial Tidying & Date Extraction ---
+actigraphy_raw <- bind_rows(data_list) %>%
+  rename(Variable = Day) %>%
+  pivot_longer(cols = matches("^[0-9]+$"), names_to = "Day", values_to = "Value") %>%
+  mutate(Day = as.integer(Day))
+
+# Create Date Mapping (Excel serial to R Date) 
+date_mapping <- actigraphy_raw %>%
+  filter(Variable == "Start day") %>%
+  mutate(Date = as.Date(as.numeric(Value), origin = "1899-12-30")) %>%
+  select(id, Timepoint, Day, Date)
+
+# --- 3. Variable Recoding & Unit Conversion ---
+# Define clock-time variables for conversion
+time_vars <- c("Lights out", "Fell asleep", "Woke up", "Got up")
+
+final_combined_data <- actigraphy_raw %>%
+  filter(!Variable %in% c("Start day", "End day", "Day of week")) %>%
+  mutate(Week = case_when(
+    Timepoint == "BSL" ~ "BSL", 
+    Timepoint == "SRT" & Day <= 7 ~ "1",
+    Timepoint == "SRT" & Day <= 14 ~ "2",
+    Timepoint == "SRT" & Day <= 21 ~ "3",
+    Timepoint == "SRT" & Day <= 28 ~ "4",
+    TRUE ~ NA_character_
+  )) %>%
+  mutate(Variable = fct_recode(Variable, 
+                               "TST" = "Actual sleep time", "TIB" = "Time in bed",
+                               "SOL" = "Sleep latency", "SE" = "Sleep efficiency (%)",
+                               "midpoint_sleep" = "Central Phase Measure (min)",
+                               "Wake(%)" = "Actual wake (%)", "WASO" = "Actual wake time",
+                               "Wake_bouts" = "Wake bouts", "Mean_wake_bout" = "Mean wake bout")) %>%
+  # Merge the extracted Dates
+  left_join(date_mapping, by = c("id", "Timepoint", "Day")) %>%
+  mutate(Value = as.numeric(Value)) %>%
+  # --- 4. Unit and Clock-Time Conversion ---
+  mutate(
+    # Convert Durations to Minutes
+    Value = if_else(Variable %in% c("TST", "TIB", "SOL", "WASO", "Mean_wake_bout"), 
+                    Value * 1440, Value),
+    # Convert Decimals to hms Clock-Time 
+    Clock_Time = if_else(Variable %in% time_vars, 
+                         as_hms(Value * 86400), 
+                         as_hms(NA))
+  ) %>%
+  filter(!is.na(Value))
+
+# --- 5. Report & Save ---
+cat("## ✅ Actigraphy Data Cleaned with Calendar Dates and Clock Times\n")
+print(head(final_combined_data %>% select(id, Variable, Day, Date, Value, Clock_Time)))
+
+# ==============================================================================
+# 11. CALCULATION OF WAKE PERIOD ACTIVITY & LIGHT
+# ==============================================================================
+
+library(tidyverse)
+library(lubridate)
+library(stringr)
+
+# --- 1. HELPERS ---
+log_zero_inflated <- function(x) log(x + 1)
+exp_zero_inflated <- function(x) exp(x) - 1
+
+log_geom_mean <- function(x) {
+  if(length(x) == 0 || all(is.na(x))) return(NA_real_)
+  exp(mean(log_zero_inflated(x), na.rm = TRUE)) - 1
+}
+
+# --- 2. PREPARE SLEEP PERIODS ---
+sleep_timing_base <- final_combined_data %>%
+  select(id, Timepoint, Week, Day, Date, Variable, Clock_Time) %>%
+  filter(Variable %in% c("Lights out", "Got up")) %>%
+  pivot_wider(names_from = Variable, values_from = Clock_Time) %>%
+  mutate(id = str_pad(as.character(as.numeric(id)), 3, pad = "0"),
+         Day = as.numeric(Day)) %>%
+  arrange(id, Day) %>% 
+  group_by(id, Timepoint) %>%
+  mutate(
+    # Segmentation for non-consecutive days
+    day_diff = Day - lag(Day, default = first(Day)),
+    block_start = ifelse(day_diff > 1, 1, 0),
+    segment_id = cumsum(block_start),
+    # Timing anchors
+    wake_start = as.POSIXct(paste(Date, `Got up`), tz = "UTC"),
+    wake_end_date = if_else(`Lights out` < `Got up`, Date + days(1), Date),
+    wake_end = as.POSIXct(paste(wake_end_date, `Lights out`), tz = "UTC"),
+    # 4-hour windows
+    pre_bed_start = wake_end - hours(4),
+    post_wake_end = wake_start + hours(4),
+    wake_duration_hrs = as.numeric(difftime(wake_end, wake_start, units = "hours"))
+  ) %>%
+  ungroup()
+
+# --- 3. ALIGN SENSOR DATA (final_imputed_all) ---
+sensor_data_clean <- final_imputed_all %>%
+  # Ensure ID is also 3 digits just in case
+  mutate(id = str_pad(as.character(as.numeric(id)), 3, pad = "0"),
+         Day = as.numeric(Day))
+
+# --- 4. CALCULATION 
+wake_metrics_processed <- sensor_data_clean %>%
+  # Join on the primary anchors (id, Timepoint, Day)
+  inner_join(sleep_timing_base, by = c("id", "Timepoint", "Day")) %>%
+  group_by(id, Timepoint, Week, Day, Date.y, segment_id, wake_start, wake_end, 
+           pre_bed_start, post_wake_end, wake_duration_hrs) %>%
+  summarise(
+    # Full Wake Period
+    mean_wake_act   = mean(activity_imputed[Datetime >= wake_start & Datetime < wake_end], na.rm = TRUE),
+    geom_wake_light = log_geom_mean(light_imputed[Datetime >= wake_start & Datetime < wake_end]),
+    
+    # 4h Pre-Bed
+    mean_prebed_act   = mean(activity_imputed[Datetime >= pre_bed_start & Datetime < wake_end], na.rm = TRUE),
+    geom_prebed_light = log_geom_mean(light_imputed[Datetime >= pre_bed_start & Datetime < wake_end]),
+    
+    # 4h Post-Wake
+    mean_postwake_act   = mean(activity_imputed[Datetime >= wake_start & Datetime < post_wake_end], na.rm = TRUE),
+    geom_postwake_light = log_geom_mean(light_imputed[Datetime >= wake_start & Datetime < post_wake_end]),
+    
+    .groups = "drop"
+  ) %>%
+  rename(Date = Date.y)
+
+# --- 5. REPORT ---
+cat(paste("Total participants processed:", n_distinct(wake_metrics_processed$id), "\n"))
+cat(paste("Total wake periods calculated:", nrow(wake_metrics_processed), "\n"))
+
+print(head(wake_metrics_processed))
+
+# --- 1. Aggregate daily transition metrics to weekly participant level ---
+wake_window_weekly <- wake_metrics_processed %>%
+  # FIX: Standardise Week labels for BSL
+  mutate(week = case_when(
+    Timepoint == "BSL" ~ "BSL", # Force all BSL days to the "BSL" category
+    TRUE ~ as.character(Week)    # Keep SRT as 1, 2, 3, 4
+  )) %>%
+  group_by(id, week) %>% 
+  summarise(across(c(mean_wake_act, geom_wake_light, mean_prebed_act, 
+                     geom_prebed_light, mean_postwake_act, geom_postwake_light, 
+                     wake_duration_hrs), mean, na.rm = TRUE), .groups = "drop") %>%
+  rename(avg_wake_act = mean_wake_act, avg_wake_light = geom_wake_light,
+         avg_prebed_act = mean_prebed_act, avg_prebed_light = geom_prebed_light,
+         avg_postwake_act = mean_postwake_act, avg_postwake_light = geom_postwake_light,
+         avg_wake_duration = wake_duration_hrs)
+```
+
+# 7. Compute the Light Metrics
+This section executes a custom pipeline designed to extract rest-activity rhythm markers and light metrics. This process employs a 24-hour template-matching approach to standardise every recording day to exactly 1,440 minutes, preventing bias from partial-day recordings. For all metrics, data are aggregated hourly before calculation. 
+
+The code calculates the M10 (most active 10 hours) and L5 (least active 5 hours) for activity, alongside the B10 (brightest 10 hours) and D5 (darkest 5 hours) for light exposure using the function *bright_dark_period* from LightLogR. Light intensity values undergo a logarithmic transformation ($\log_{10}(x + 1)$) prior to averaging. This log-transform normalises the skewed distribution of light and ensures that the resulting Geometric Means accurately reflect light exposure rather than being disproportionately weighted by transient, extreme lux peaks. Furthermore, all temporal onsets and midpoints are derived using Circular Statistics to ensure accurate time-averaging across the midnight threshold.
+
+We compute the photoperiod for each day using the *suncalc* package, which provides sunrise and sunset times based on the date and geographic location (Oxfordshire). The photoperiod is calculated as the duration between sunrise and sunset in minutes. 
+
+We also calculate Relative Amplitude (RA) and Interdaily Stability (IS) and Intradaily Variability (IV) for both activity and light. To ensure compatibility with standard methods [Van Someren et al. (1999)](https://pubmed.ncbi.nlm.nih.gov/10442243/).), these metrics are computed using the *LightLogR* package with data binned into 60-minute intervals already by the function. IS and IV are computed only on full 24 hour days, thus they use a more conservative dataset than the other metrics.
+
+All metrics are computed at the daily level before averaging per week (BSL, 1-4). 
+```{r, 7-compute-light-metrics}
+library(suncalc)
+# ==============================================================================
+# 7. UPDATED MASTER METRICS FUNCTION
+# ==============================================================================
+
+library(LightLogR)
+
+compute_master_metrics_imputed <- function(df, light_col = "light_imputed", act_col = "activity_imputed", raw_light_col = "light") {
+  
+  # --- Step A: Daily Level ---
+  daily_stats <- df %>%
+    group_by(id, week, Date = as.Date(Datetime)) %>%
+    reframe({
+      l_vec <- as.numeric(pick(all_of(light_col))[[1]])
+      a_vec <- as.numeric(pick(all_of(act_col))[[1]])
+      dt <- Datetime
+      current_date <- Date[1]
+      
+      if(length(dt) == 1440) {
+        sun <- suncalc::getSunlightTimes(date = current_date, lat = 51.7520, lon = -1.2577, keep = c("sunrise", "sunset"))
+        
+        m10_act <- tryCatch(suppressWarnings(bright_dark_period(a_vec, dt, "brightest", "10 hours", as.df=T)), error = function(e) NULL)
+        l5_act  <- tryCatch(suppressWarnings(bright_dark_period(a_vec, dt, "darkest", "5 hours", as.df=T)), error = function(e) NULL)
+        b10_li  <- tryCatch(suppressWarnings(bright_dark_period(log_zero_inflated(l_vec), dt, "brightest", "10 hours", as.df=T)), error = function(e) NULL)
+        d5_li   <- tryCatch(suppressWarnings(bright_dark_period(log_zero_inflated(l_vec), dt, "darkest", "5 hours", as.df=T)), error = function(e) NULL)
+        
+        if(!is.null(m10_act) && !is.null(l5_act) && !is.null(b10_li) && !is.null(d5_li)) {
+          idx_250 <- which(l_vec >= 250)
+          d_flit_250 = if(length(idx_250) > 0) as.numeric(hms::as_hms(dt[min(idx_250)])) / 3600 else NA
+          d_llit_250 = if(length(idx_250) > 0) as.numeric(hms::as_hms(dt[max(idx_250)])) / 3600 else NA
+          d_mlit_250 = if(length(idx_250) > 0) circular_mean_hours(as.numeric(hms::as_hms(dt[idx_250])) / 3600) else NA
+
+          tibble(
+            d_m10_act_val = m10_act$brightest_10h_mean,
+            d_m10_start   = as.numeric(hms::as_hms(m10_act$brightest_10h_onset))/3600,
+            d_l5_act_val  = l5_act$darkest_5h_mean,
+            d_l5_start    = as.numeric(hms::as_hms(l5_act$darkest_5h_onset))/3600,
+            d_b10_li_val  = b10_li$brightest_10h_mean,
+            d_b10_start   = as.numeric(hms::as_hms(b10_li$brightest_10h_onset))/3600,
+            d_d5_li_val   = d5_li$darkest_5h_mean,
+            d_d5_start    = as.numeric(hms::as_hms(d5_li$darkest_5h_onset))/3600,
+            flit_250 = d_flit_250, llit_250 = d_llit_250, mlit_250 = d_mlit_250,
+            dose_hrs = sum(l_vec, na.rm = TRUE) / 60,
+            d_tat500  = sum(l_vec >= 500, na.rm = T), 
+            d_tat1000 = sum(l_vec >= 1000, na.rm = T),
+            d_photo   = as.numeric(difftime(sun$sunset, sun$sunrise, units = "mins")),
+            d_miss    = sum(is.na(pick(all_of(raw_light_col)))) / 1440
+          )
+        } else { tibble() }
+      } else { tibble() }
+    })
+
+  # --- Step B: Rhythm Metrics ---
+  rhythm_stats <- df %>%
+    group_by(id, week, Date = as.Date(Datetime)) %>%
+    filter(n() == 1440) %>% 
+    group_by(id, week) %>%
+    summarise(
+      n_complete_days = as.numeric(n_distinct(Date)), 
+      IS_act = interdaily_stability(!!sym(act_col), Datetime),
+      IV_act = intradaily_variability(!!sym(act_col), Datetime),
+      IS_light = interdaily_stability(!!sym(light_col), Datetime),
+      IV_light = intradaily_variability(!!sym(light_col), Datetime),
+      .groups = "drop"
+    )
+
+  # --- Step C: Weekly Aggregation (Including Streak) ---
+  weekly_gen <- daily_stats %>%
+    group_by(id, week) %>%
+    arrange(Date) %>%
+    mutate(
+      # Calculate Streak: Identify groups of consecutive dates
+      diff_date = c(1, diff(Date)),
+      new_streak = diff_date > 1,
+      streak_id = cumsum(new_streak)
+    ) %>%
+    group_by(id, week, streak_id) %>%
+    mutate(streak_len = n()) %>%
+    group_by(id, week) %>%
+    summarise(
+      n_valid_days = n(),
+      avg_streak = mean(streak_len), # Average length of consecutive blocks
+      avg_daily_missing = mean(d_miss, na.rm=T),
+      Photo_avg = mean(d_photo, na.rm = T),
+      M10_act_avg = mean(d_m10_act_val, na.rm=T)*60,
+      L5_act_avg  = mean(d_l5_act_val, na.rm=T)*60,
+      M10_start_hour = circular_mean_hours(d_m10_start),
+      L5_start_hour  = circular_mean_hours(d_l5_start),
+      RA_act = (M10_act_avg - L5_act_avg)/(M10_act_avg + L5_act_avg),
+      B10_GM_lux = exp_zero_inflated(mean(d_b10_li_val, na.rm=T)),
+      D5_GM_lux  = exp_zero_inflated(mean(d_d5_li_val, na.rm=T)),
+      B10_start_hour = circular_mean_hours(d_b10_start),
+      D5_start_hour  = circular_mean_hours(d_d5_start),
+      RA_light = (B10_GM_lux - D5_GM_lux)/(B10_GM_lux + D5_GM_lux),
+      Dose_Lux_Hrs = mean(dose_hrs, na.rm = TRUE),
+      FLiT_250_avg = circular_mean_hours(flit_250),
+      MLiT_250_avg = circular_mean_hours(mlit_250),
+      LLiT_250_avg = circular_mean_hours(llit_250),
+      TAT_500_avg  = mean(d_tat500, na.rm = T),
+      TAT_1000_avg = mean(d_tat1000, na.rm = T),
+      .groups = "drop"
+    ) %>%
+    filter(n_valid_days >= 4) # Applying my 4-day rule
+
+  left_join(weekly_gen, rhythm_stats, by = c("id", "week"))
+}
+
+# ==============================================================================
+# 8. DEFINE LOOKUP 
+# ==============================================================================
+
+metric_lookup <- tribble(
+  ~var,                 ~Pretty_Name,                                ~Category,
+  
+  # --- RECORDING DETAILS ---
+  "n_valid_days",      "Average Valid Days (<3 Hours Missing)",      "RECORDING DETAILS",
+  "avg_streak",       "Average Consecutive Valid Days",              "RECORDING DETAILS",
+  "avg_daily_missing", "Pre-Imputation Daily Missing (%)",          "RECORDING DETAILS",
+  "Photo_avg",         "Photoperiod (HH:MM)",                       "RECORDING DETAILS",
+  "avg_wake_duration", "Wake Period Duration (Hours)",              "RECORDING DETAILS",
+
+  # --- ACTIVITY METRICS ---
+  "RA_act",            "RA",                   "ACTIVITY METRICS",
+  "IS_act",            "IS",                 "ACTIVITY METRICS",
+  "IV_act",            "IV",               "ACTIVITY METRICS",
+  "M10_act_avg",       "M10 Average Activity",       "ACTIVITY METRICS",
+  "L5_act_avg",        "L5 Average Activity",        "ACTIVITY METRICS",
+  "M10_start_hour",    "M10 Start Hour",                    "ACTIVITY METRICS",
+  "L5_start_hour",     "L5 Start Hour",                     "ACTIVITY METRICS",
+  "avg_wake_act",      "Average Wake Period Activity",               "ACTIVITY METRICS",
+  "avg_prebed_act",    "Activity 4hrs Pre-Bedtime",                "ACTIVITY METRICS",
+  "avg_postwake_act",  "Activity 4hrs Post-risetime",              "ACTIVITY METRICS",
+    "SRI",               "SRI",              "ACTIVITY METRICS",
+
+  # --- LIGHT METRICS ---
+  "RA_light",          "RA (Light)",                                "LIGHT METRICS",
+  "IS_light",          "IS (Light)",                                "LIGHT METRICS",
+  "IV_light",          "IV (Light)",                                "LIGHT METRICS",
+  "B10_GM_lux",        "B10 Average Lux",          "LIGHT METRICS",
+  "D5_GM_lux",         "D5 Average Lux ",           "LIGHT METRICS",
+  "B10_start_hour",    "B10 Start Hour",                    "LIGHT METRICS",
+  "D5_start_hour",     "D5 Start Hour",                     "LIGHT METRICS",
+  "avg_wake_light",    "Average Wake Period Lux",          "LIGHT METRICS",
+  "avg_prebed_light",  "Lux 4hrs Pre-Bedtime",           "LIGHT METRICS",
+  "avg_postwake_light","Lux 4hrs Post-risetime",         "LIGHT METRICS",
+  "Dose_Lux_Hrs",      "Dose (Lux-Hours)",         "LIGHT METRICS",
+  "FLiT_250_avg",      "FLiT ≥ 250lx",         "LIGHT METRICS",
+  "MLiT_250_avg",      "MLiT ≥ 250lx",          "LIGHT METRICS",
+  "LLiT_250_avg",      "LLiT ≥ 250lx",          "LIGHT METRICS",
+  "TAT_500_avg",       "Time ≥ 500 Lux (Minutes)",                  "LIGHT METRICS", 
+  "TAT_1000_avg",      "Time ≥ 1000 Lux (Minutes)",                 "LIGHT METRICS",
+  "LRI",               "LRI",              "LIGHT METRICS"
+)
+```
+
+# 8. LRI and SRI
+```{r}
+# ==============================================================================
+# SRI and LRI
+# ==============================================================================
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(hms)
+
+# 1.1. Philips Weighting Vector for Activity
+philips_oakley_weights <- function(x) {
+  if(length(x) < 9) return(NA_real_) 
+  weights <- c(0.04, 0.04, 0.2, 0.2, 2.0, 0.2, 0.2, 0.04, 0.04)
+  return(sum(x * weights))
+}
+
+# 1.2. Run Pure 24h Automated State Detection Across Raw Epochs
+regularity_timeline_prepped <- final_imputed_all %>%
+  mutate(
+    id = str_pad(as.character(as.numeric(id)), 3, pad = "0"),
+    Timepoint = as.character(Timepoint),
+    Day = as.numeric(Day)
+  ) %>%
+  select(-any_of(c("philips_tac", "sleep_binary", "light_binary"))) %>%
+  arrange(id, Datetime) %>%
+  group_by(id) %>%
+  mutate(
+    # Smooth activity counts using native rolling windows
+    philips_tac = slide_dbl(activity_imputed, philips_oakley_weights, .before = 4, .after = 4),
+    philips_tac = if_else(is.na(philips_tac), activity_imputed, philips_tac),
+    
+    # NO LOGS DIARY: Score as sleep ONLY if movement is low AND light is low (<50 lux)
+    # This automatically protects daytime desk-sitting from being marked as sleep.
+    sleep_binary = if_else(philips_tac <= 40 & light_imputed < 50, 1, 0),
+    
+    # Light Scoring (Pure 24h Threshold)
+    light_binary = if_else(light_imputed > 100, 1, 0)
+  ) %>%
+  ungroup()
+
+# 1.3. Time-Matched 24h Regularity Index Calculator (Standard 0-100 Scale)
+calculate_raw_weekly_indices <- function(df_group) {
+  
+  timeline_clean <- df_group %>%
+    group_by(Datetime) %>%
+    summarise(
+      sleep_binary = first(sleep_binary), 
+      light_binary = first(light_binary), 
+      .groups = "drop"
+    ) %>%
+    arrange(Datetime) %>%
+    mutate(Target_Tomorrow = Datetime + lubridate::hours(24))
+  
+  tomorrow_lookup <- timeline_clean %>% 
+    select(Datetime, sleep_tomorrow = sleep_binary, light_tomorrow = light_binary)
+  
+  paired_data <- timeline_clean %>%
+    left_join(tomorrow_lookup, by = c("Target_Tomorrow" = "Datetime")) %>%
+    filter(!is.na(sleep_tomorrow) & !is.na(light_tomorrow))
+  
+  Total_Pairs <- nrow(paired_data)
+  
+  if (Total_Pairs == 0) {
+    return(tibble(SRI = NA_real_, LRI = NA_real_))
+  }
+  
+  sleep_matches <- sum(paired_data$sleep_binary == paired_data$sleep_tomorrow)
+  light_matches <- sum(paired_data$light_binary == paired_data$light_tomorrow)
+  
+  # Standard Phillips Scaling
+  sri_score <- (sleep_matches / Total_Pairs) * 100
+  lri_score <- (light_matches / Total_Pairs) * 100
+  
+  return(tibble(SRI = sri_score, LRI = lri_score))
+}
+
+individual_raw_indices <- regularity_timeline_prepped %>%
+  mutate(
+    week_label = case_when(
+      week %in% c("1", "2", "3", "4") ~ as.character(week),
+      TRUE ~ "BSL"
+    ),
+    week = factor(week_label, levels = c("BSL", "1", "2", "3", "4"))
+  ) %>%
+  group_by(id, week) %>%
+  group_modify(~ calculate_raw_weekly_indices(.x)) %>%
+  ungroup()
+
+# ==============================================================================
+# FINAL COHORT AGGREGATION & COMBINATION
+# ==============================================================================
+cohort_indices_aggregated <- individual_raw_indices %>%
+  filter(!is.na(SRI) & !is.na(LRI)) %>%
+  group_by(week) %>%
+  summarise(
+    Cohort_Average_SRI = mean(SRI, na.rm = TRUE),
+    Cohort_Average_LRI = mean(LRI, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+final_master_cohort_summary <- cohort_indices_aggregated %>%
+  select(
+    `Study Week` = week,
+    `Cohort SRI (Activity Regularity)` = Cohort_Average_SRI,
+    `Cohort LRI (Light Regularity)`    = Cohort_Average_LRI
+  ) %>%
+  arrange(`Study Week`)
+
+print("--- FINAL INTEGRATED PURE 24H COHORT REPORT ---")
+print(final_master_cohort_summary)
+
+
+library(tidyverse)
+library(lubridate)
+library(slider)
+library(patchwork)
+
+# --- 1. Re-generate Minute-Level Classifications for Visual Inspection ---
+# We run the exact same logic here to get a minute-by-minute visualisation dataframe
+visual_timeline <- final_imputed_all %>%
+  mutate(id = str_pad(as.character(as.numeric(id)), 3, pad = "0")) %>%
+  # Filter to a few specific participants to keep the plot clean
+  filter(id %in% c("011")) %>%
+  arrange(id, Datetime) %>%
+  group_by(id) %>%
+  mutate(
+    # Compute the smoothed activity line
+    philips_tac = slide_dbl(activity_imputed, philips_oakley_weights, .before = 4, .after = 4),
+    philips_tac = if_else(is.na(philips_tac), activity_imputed, philips_tac),
+    
+    # Apply our 24h Dual Rules
+    is_dark = if_else(light_imputed < 50, 1, 0),
+    is_quiet = if_else(philips_tac <= 40, 1, 0),
+    sleep_binary = if_else(is_quiet == 1 & is_dark == 1, 1, 0),
+    
+    # Create an explicit character state for mapping colors
+    State = case_when(
+      sleep_binary == 1 ~ "Classified Sleep",
+      is_quiet == 1 & is_dark == 0 ~ "Daytime Sedentary (Overridden to Wake)",
+      TRUE ~ "Active Wake"
+    )
+  ) %>%
+  ungroup() %>%
+  filter(Datetime >= min(Datetime) & Datetime <= (min(Datetime) + lubridate::days(2)))
+
+# --- 2. Build the Diagnostic Plot ---
+ggplot(visual_timeline, aes(x = Datetime, y = philips_tac)) +
+  # A. Shade the background where the environment is dark (< 50 Lux)
+  geom_area(aes(y = if_else(is_dark == 1, max(philips_tac, na.rm=TRUE), 0)), 
+            fill = "gray90", alpha = 0.5) +
+  
+  # B. Plot the smoothed activity counts
+  geom_line(color = "gray40", alpha = 0.7, size = 0.5) +
+  
+  # C. Highlight the epochs based on their classification state
+  geom_point(aes(color = State), alpha = 0.6, size = 1) +
+  
+  # D. Style the colors to make daytime overrides stand out
+  scale_color_manual(values = c(
+    "Classified Sleep" = "#2c7bb6",                        # Clean Circadian Blue
+    "Daytime Sedentary (Overridden to Wake)" = "#d7191c",   # Warning Red
+    "Active Wake" = "transparent"                          # Leave raw line visible
+  )) +
+  
+  # E. Facet by Participant so they stack neatly
+  facet_wrap(~paste("Participant:", id), ncol = 1, scales = "free_y") +
+  
+  # F. Themes
+  theme_minimal() +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "gray95", color = NA),
+    strip.text = element_text(face = "bold", size = 10),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Dual-Sensor Sleep Detection Diagnostic Plot",
+    subtitle = "Shaded grey blocks indicate dark environments (< 50 Lux). Red points highlight sedentary daytime data correctly saved from false-sleep classification.",
+    x = "Timeline (48-Hour Sample Window)",
+    y = "Smoothed Activity Counts (Philips TAC)",
+    color = "Algorithmic Decision Status:"
+  )
+```
+
+# 9. Create a Summary Statistics Table
+This section generates the summary statistics and puts them into a publication-ready Microsoft Word table.
+```{r, 9-summary-stats}
+
+# ==============================================================================
+# 9. SUMMARY STATISTICS TABLE 
+# ==============================================================================
+
+# --- Helper: Circular SD for Table ---
+circular_sd_hours <- function(hours) {
+  if(all(is.na(hours))) return(NA)
+  rads <- hours * (2 * pi / 24)
+  S <- sqrt(-log(abs(mean(exp(1i * rads), na.rm = TRUE))))
+  return(S * (24 / (2 * pi)))
+}
+
+get_table_stats <- function(data) {
+  
+  # 1. Aggregation witCircular Logic
+  stats_raw <- data %>%
+    group_by(week) %>%
+    summarise(across(where(is.numeric), list(
+      mean = ~ {
+        # Strict override: SRI and LRI are scalar scores (0 to 100), not daily times
+        if(cur_column() %in% c("SRI", "LRI")) mean(.x, na.rm = TRUE)
+        else if(grepl("hour|start|onset|Timing|LiT", cur_column(), ignore.case = TRUE)) circular_mean_hours(.x)
+        else mean(.x, na.rm = TRUE)
+      },
+      sd = ~ {
+        if(cur_column() %in% c("SRI", "LRI")) sd(.x, na.rm = TRUE)
+        else if(grepl("hour|start|onset|Timing|LiT", cur_column(), ignore.case = TRUE)) circular_sd_hours(.x)
+        else sd(.x, na.rm = TRUE)
+      }
+    )), .groups = "drop")
+  
+  # 2. Reshape long
+  stats_long <- stats_raw %>%
+    pivot_longer(cols = -week, names_to = "metric", values_to = "val") %>%
+    separate(metric, into = c("var", "stat"), sep = "_(?=[^_]+$)") %>%
+    pivot_wider(names_from = stat, values_from = val)
+  
+  # 3. Precise Formatting Logic
+  stats_formatted <- stats_long %>%
+    mutate(mean_sd = case_when(
+      # Format Regularity Scores cleanly to 1 decimal place: e.g., "78.4 (5.2)"
+      var %in% c("SRI", "LRI") ~ sprintf("%.1f (%.1f)", mean, sd),
+      
+      var == "avg_daily_missing" ~ {
+        mean_pct <- mean * 100
+        sd_pct   <- sd * 100
+        sprintf("%.2f%% ± %.2f%% (%s ± %s)", 
+                mean_pct, sd_pct,
+                format_seconds_to_hhmm(mean * 1440 * 60), 
+                format_seconds_to_hhmm(sd * 1440 * 60))
+      },
+      
+      var %in% c("n_valid_days", "n_complete_days") ~ sprintf("%.1f (%.1f)", mean, sd),
+      var == "avg_wake_duration" ~ paste0(format_seconds_to_hhmm(mean * 3600), " (", format_seconds_to_hhmm(sd * 3600), ")"),
+      var == "Dose_Lux_Hrs" ~ sprintf("%.0f (%.0f)", mean, sd),
+      
+      var %in% c("M10_act_avg", "L5_act_avg", "B10_GM_lux", "D5_GM_lux", 
+                 "avg_wake_act", "avg_prebed_act", "avg_postwake_act",
+                 "avg_wake_light", "avg_prebed_light", "avg_postwake_light") ~ sprintf("%.2f (%.2f)", mean, sd),
+        
+      grepl("hour|start|onset|Timing|LiT", var, ignore.case = TRUE) ~ 
+        paste0(format_seconds_to_hhmm(mean * 3600), " (", format_seconds_to_hhmm(sd * 3600), ")"),
+        
+      (grepl("Photo|TAT", var, ignore.case = TRUE) & !grepl("days", var)) ~ 
+        paste0(format_seconds_to_hhmm(mean * 60), " (", format_seconds_to_hhmm(sd * 60), ")"),
+        
+      TRUE ~ sprintf("%.2f (%.2f)", mean, sd)
+    )) %>%
+    select(week, var, mean_sd)
+  
+  return(stats_formatted)
+}
+
+# ==============================================================================
+# EXECUTION
+# ==============================================================================
+
+# 1. Generate the Automated 24h Sleep/Wake Classifications
+# (This steps through and populates the raw combinations for SRI & LRI)
+regularity_timeline_prepped <- final_imputed_all %>%
+  mutate(
+    id = str_pad(as.character(as.numeric(id)), 3, pad = "0"),
+    Timepoint = as.character(Timepoint),
+    Day = as.numeric(Day)
+  ) %>%
+  select(-any_of(c("philips_tac", "sleep_binary", "light_binary"))) %>%
+  arrange(id, Datetime) %>%
+  group_by(id) %>%
+  mutate(
+    philips_tac = slide_dbl(activity_imputed, philips_oakley_weights, .before = 4, .after = 4),
+    philips_tac = if_else(is.na(philips_tac), activity_imputed, philips_tac),
+    
+    # 24h Automated Logic: Low activity AND Dark environmental conditions
+    sleep_binary = if_else(philips_tac <= 40 & light_imputed < 50, 1, 0),
+    light_binary = if_else(light_imputed > 100, 1, 0)
+  ) %>%
+  ungroup()
+
+# 2. Run the Time-Matched Kronecker Delta function to build regularity_results
+regularity_results <- regularity_timeline_prepped %>%
+  mutate(
+    week_label = case_when(
+      week %in% c("1", "2", "3", "4") ~ as.character(week),
+      TRUE ~ "BSL"
+    ),
+    week = factor(week_label, levels = c("BSL", "1", "2", "3", "4"))
+  ) %>%
+  group_by(id, week) %>%
+  group_modify(~ calculate_raw_weekly_indices(.x)) %>%
+  ungroup()
+
+# 3. Compute Master Metrics (IS, IV, RA, etc.)
+final_metrics_results <- compute_master_metrics_imputed(final_imputed_all)
+
+# 4. Combine Master, Transition, and Regularity metrics 
+final_metrics_combined <- final_metrics_results %>%
+  mutate(week = as.character(week)) %>%
+  # Join transition metrics (Wake, Pre-bed, etc.)
+  left_join(wake_window_weekly %>% mutate(week = as.character(week)), by = c("id", "week")) %>%
+  # Join Regularity Metrics safely as numeric scalars
+  left_join(regularity_results %>% 
+              mutate(week = as.character(week)) %>% 
+              select(id, week, SRI, LRI), by = c("id", "week")) %>%
+  mutate(across(c(SRI, LRI), as.numeric))
+
+# 5. Generate Aggregated Table Summary Rows
+final_imputed_stats <- get_table_stats(final_metrics_combined)
+
+# 6. Wide Formatting and Lookup Alignment
+final_summary_wide <- final_imputed_stats %>%
+  inner_join(metric_lookup, by = "var") %>%
+  mutate(
+    Pretty_Name = factor(Pretty_Name, levels = metric_lookup$Pretty_Name),
+    week = factor(week, levels = c("BSL", "1", "2", "3", "4"), 
+                  labels = c("Baseline", "Week 1", "Week 2", "Week 3", "Week 4")),
+    Category = factor(Category, levels = c("RECORDING DETAILS", "ACTIVITY METRICS", "LIGHT METRICS"))
+  ) %>%
+  arrange(Category, Pretty_Name) %>% 
+  select(Category, Variable = Pretty_Name, week, mean_sd) %>%
+  pivot_wider(names_from = week, values_from = mean_sd) %>%
+  relocate(Baseline, .after = Variable)
+
+# 7. Flextable Compilation
+ft <- final_summary_wide %>%
+  arrange(Category) %>%
+  as_grouped_data(groups = "Category") %>%
+  flextable() %>%
+  bold(i = ~ !is.na(Category), part = "body") %>%
+  bg(i = ~ !is.na(Category), bg = "#F7F7F7", part = "body") %>%
+  align(j = 2:ncol(final_summary_wide), align = "center", part = "all")
+
+# 8. Apply Footnotes
+ft <- ft %>%
+  add_footer_lines(c(
+    "[1] Lux/GM: Light intensity metrics are calculated as a Geometric Mean.",
+    "[2] Start Hour/LiT: Modeled using Circular Statistics (FLiT = First, MLiT = Mean, LLiT = Last timing).",
+    "[3] SRI/LRI: Calculated across continuous timelines using automated 24h dual-sensor classification constraints."
+  )) %>%
+  fontsize(size = 8, part = "footer") %>%
+  italic(part = "footer")
+
+final_summary_ft <- ft %>% autofit()
+final_summary_ft
+```
+
+
+# 10. Data Visualisation 
+This section creates bar plots of the key metrics. For the time-based metrics (onsets, photoperiod), we use circular statistics to calculate the mean and standard deviation, and we convert these into a more interpretable format (HH:MM) for the axis labels. The plots are designed to be publication-ready, with a consistent colour palette and clear labelling. We also create a polar histogram to visualise the distribution of onset times across the 24-hour cycle.
+```{r, 10-data-vis, fig.width=9, fig.height=12}
+# ==============================================================================
+# 10. MASTER DATA VISUALISATION: ULTRA-TIGHT SPACING & FIXED AXES
+# ==============================================================================
+library(tidyverse)
+library(patchwork)
+library(scales)
+library(here)
+
+# --- 1.  MATHS---
+circular_mean_hours <- function(hours) {
+  if(all(is.na(hours))) return(NA)
+  rads <- hours * (2 * pi / 24)
+  M <- atan2(mean(sin(rads), na.rm = TRUE), mean(cos(rads), na.rm = TRUE))
+  mean_hour <- M * (24 / (2 * pi))
+  if (mean_hour < 0) mean_hour <- mean_hour + 24
+  return(mean_hour)
+}
+
+circular_sd_hours <- function(hours) {
+  if(all(is.na(hours))) return(NA)
+  rads <- hours * (2 * pi / 24)
+  S <- sqrt(-log(abs(mean(exp(1i * rads), na.rm = TRUE))))
+  return(S * (24 / (2 * pi)))
+}
+
+clean_plot_labels <- as_labeller(c(
+  RA_act = "RA", IS_act = "IS", IV_act = "IV", 
+  M10_act_avg = "M10", L5_act_avg = "L5", SRI = "SRI",
+  avg_wake_act = "Wake Period Activity", 
+  avg_postwake_act = "Activity 4hrs Post-Risetime", 
+  avg_prebed_act = "Activity 4hrs Pre-Bedtime",
+  RA_light = "RA", IS_light = "IS", IV_light = "IV", 
+  B10_GM_lux = "B10", D5_GM_lux = "D5", LRI = "LRI",
+  avg_wake_light = "Wake Lux", 
+  avg_postwake_light = "Lux 4hrs Post-Risetime", 
+  avg_prebed_light = "Lux 4hrs Pre-Bedtime",
+  M10_start_hour = "M10 Onset", L5_start_hour = "L5 Onset",
+  B10_start_hour = "B10 Onset", D5_start_hour = "D5 Onset",
+  FLiT_250_avg = "FLiT", MLiT_250_avg = "MLiT", LLiT_250_avg = "LLiT",
+  Dose_Lux_Hrs = "Lux-Hours", TAT_500_avg = "TAT 500", TAT_1000_avg = "TAT 1000",
+  Photo_avg = "Photoperiod"
+))
+
+# --- 2. PLOT CONSTRUCTORS ---
+
+# --- 1. Updated Bar Plot 
+make_dynamic_bar <- function(data_raw, data_summary, vars_to_plot, y_lab, bar_color, num_cols) {
+  df_raw <- data_raw %>% filter(Metric %in% vars_to_plot)
+  df_sum <- data_summary %>% filter(Metric %in% vars_to_plot)
+  
+  ggplot() +
+    geom_col(data = df_sum, aes(x = week, y = mean_val), fill = bar_color, alpha = 0.8, width = 0.7) +
+    geom_jitter(data = df_raw, aes(x = week, y = Value), width = 0.15, alpha = 0.3, size = 0.7) +
+    geom_errorbar(data = df_sum, aes(x = week, ymin = mean_val - sem_val, ymax = mean_val + sem_val), width = 0.2) +
+    facet_wrap(~Metric, scales = "free_y", labeller = clean_plot_labels, ncol = num_cols, axes = "all") + 
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+    theme_bw() + 
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(face = "bold", size = 10),
+      axis.title.x = element_blank(), 
+      axis.line.x = element_line(color = "black", linewidth = 0.6),
+      axis.line.y = element_line(color = "black", linewidth = 0.6)
+    ) +
+    labs(y = y_lab)
+}
+
+# --- 2. Rose Plot
+
+make_full_rose_wedges <- function(data_raw, data_summary, vars_to_plot, palette) {
+  df_plot <- data_raw %>% filter(Metric %in% vars_to_plot)
+  df_means <- data_summary %>% filter(Metric %in% vars_to_plot)
+  
+  ggplot() +
+    geom_histogram(data = df_plot, aes(x = Value, fill = Metric), 
+                   binwidth = 1.5, boundary = 0, alpha = 0.5, color = NA) +
+    geom_segment(data = df_means, aes(x = mean_val, xend = mean_val, y = 0, yend = Inf, color = Metric), 
+                 linewidth = 1.2) +
+    coord_polar(start = 0, clip = "off") + 
+    facet_wrap(~week, ncol = 5) + 
+    scale_x_continuous(breaks = seq(0, 21, by = 3), limits = c(0, 24), expand = c(0,0),
+                       labels = c("12a", "3a", "6a", "9a", "12p", "3p", "6p", "9p")) +
+    scale_fill_manual(values = palette, labels = clean_plot_labels) +
+    scale_color_manual(values = palette, labels = clean_plot_labels) +
+    theme_minimal() + 
+    theme(
+      axis.title = element_blank(), 
+      axis.text.y = element_blank(), 
+      axis.text.x = element_text(size = 7.5, color = "black"),
+      strip.text = element_text(face = "bold", size = 10),
+      legend.position = "top", 
+      legend.direction = "horizontal",
+      legend.title = element_blank(),
+      plot.margin = margin(t = -10, b = 0, unit = "pt"),
+      axis.line = element_blank() 
+    )
+}
+
+make_tat_stacked <- function(metrics_df) {
+  metrics_df %>%
+    mutate(week = factor(week, levels = c("BSL", "1", "2", "3", "4"))) %>%
+    select(id, week, TAT_500_avg, TAT_1000_avg) %>%
+    pivot_longer(cols = contains("TAT"), names_to = "Level", values_to = "Mins") %>%
+    mutate(Level = factor(Level, levels = c("TAT_1000_avg", "TAT_500_avg"), labels = c(">1000lx", ">500lx"))) %>%
+    ggplot(aes(x = week, y = Mins, fill = Level)) +
+    geom_bar(stat = "summary", fun = mean, position = "stack", width = 0.7) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    scale_fill_manual(values = c("#2E5984", "#AED6F1")) + theme_classic() + 
+    theme(axis.title.x = element_blank(), legend.position = "top", legend.title = element_blank(),
+          axis.line = element_line(color = "black"),
+          plot.title = element_text(size = 9, face = "bold", hjust = 0.5)) + labs(title = "TAT", y = "Mins")
+}
+
+make_dose_curve <- function(imputed_df) {
+  imputed_df %>%
+    mutate(week = factor(week, levels = c("BSL", "1", "2", "3", "4"))) %>%
+    group_by(id, week, TOD_min) %>%
+    summarise(mean_lux = mean(light_imputed, na.rm = TRUE), .groups = "drop") %>%
+    group_by(id, week) %>% mutate(cum_lux = cumsum(mean_lux)) %>%
+    ggplot(aes(x = TOD_min/60, y = cum_lux, color = week)) +
+    geom_line(stat = "summary", fun = mean, linewidth = 1) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+    scale_color_brewer(palette = "Blues", name = "Week") + 
+    theme_classic() + 
+    theme(
+      axis.title.x = element_blank(),
+      legend.position = "top", 
+      legend.direction = "horizontal",
+      axis.line = element_line(color = "black"),
+      plot.title = element_text(size = 9, face = "bold", hjust = 0.5)
+    ) + 
+    labs(title = "Cumulative Dose", y = "Lux-Hrs")
+}
+
+
+# Define the order for Activity
+act_vars <- c("RA_act", "IS_act", "IV_act", "L5_act_avg", "M10_act_avg", "SRI", 
+              "avg_wake_act", "avg_postwake_act", "avg_prebed_act")
+
+# Define the order for Light
+light_vars <- c("RA_light", "IS_light", "IV_light", "LRI", "B10_GM_lux", "D5_GM_lux", 
+                "avg_wake_light", "avg_postwake_light", "avg_prebed_light", "Photo_avg")
+
+# 1. Ensure 'all_vars' is defined correctly
+all_vars <- c(act_vars, light_vars, 
+              "M10_start_hour", "L5_start_hour", 
+              "B10_start_hour", "D5_start_hour", 
+              "FLiT_250_avg", "MLiT_250_avg", "LLiT_250_avg")
+
+# 2. Assign the result to the object
+plot_data_standardized <- final_metrics_combined %>%
+  select(id, week, all_of(intersect(all_vars, colnames(.)))) %>%
+  pivot_longer(
+    cols = -c(id, week), 
+    names_to = "Metric", 
+    values_to = "Value"
+  ) %>%
+  mutate(week = factor(week, levels = c("BSL", "1", "2", "3", "4")))
+
+# 3. Verify success immediately
+message("Success! 'plot_data_standardized' created with ", nrow(plot_data_standardized), " rows.")
+
+plot_data_standardized <- plot_data_standardized %>%
+  mutate(Value = if_else(Metric == "Photo_avg" & Value > 24, Value / 60, Value))
+
+# 2. Verify the data exists
+message("Success! 'plot_data_standardized' created with ", nrow(plot_data_standardized), " rows.")
+
+# --- 1. Data Prep Check ---
+# Ensure Photo_avg is in hours (if your data is in minutes, divide by 60)
+plot_data_standardized <- plot_data_standardized %>%
+  mutate(Value = if_else(Metric == "Photo_avg" & Value > 24, Value / 60, Value))
+
+# Re-run summary_stats so the means are updated
+summary_stats <- plot_data_standardized %>%
+  group_by(Metric, week) %>%
+  summarise(
+    mean_val = if_else(grepl("hour|start|onset|Timing|LiT", Metric[1], ignore.case = TRUE),
+                       circular_mean_hours(Value), mean(Value, na.rm = TRUE)),
+    sem_val  = if_else(grepl("hour|start|onset|Timing|LiT", Metric[1], ignore.case = TRUE),
+                       circular_sd_hours(Value) / sqrt(n()), sd(Value, na.rm = TRUE) / sqrt(n())),
+    .groups = "drop"
+  )
+
+# --- 4. ASSEMBLY & PRINT ---
+
+act_theme_color    <- "#009E73"
+light_theme_color  <- "#5382A7"
+act_rose_palette    <- c("M10_start_hour" = "#009E73", "L5_start_hour" = "#7DCEA0")
+light_rose_palette <- c("B10_start_hour" = "#2E5984", "D5_start_hour" = "#AED6F1")
+niche_palette      <- c("FLiT_250_avg" = "#5DADE2", "MLiT_250_avg" = "#2E86C1", "LLiT_250_avg" = "#1B4F72")
+
+# Create plots
+p_act <- make_dynamic_bar(plot_data_standardized, summary_stats, act_vars, "Activity Counts", act_theme_color, 3)
+
+
+
+p_light <- make_dynamic_bar(plot_data_standardized, summary_stats, light_vars, "Lux / Regularity", light_theme_color, 3)
+
+r1 <- make_full_rose_wedges(plot_data_standardized, summary_stats, c("M10_start_hour", "L5_start_hour"), act_rose_palette)
+r2 <- make_full_rose_wedges(plot_data_standardized, summary_stats, c("B10_start_hour", "D5_start_hour"), light_rose_palette)
+r3 <- make_full_rose_wedges(plot_data_standardized, summary_stats, c("FLiT_250_avg", "MLiT_250_avg", "LLiT_250_avg"), niche_palette)
+
+
+p_audit <- (make_tat_stacked(final_metrics_combined) | make_dose_curve(final_imputed_all) | 
+            make_dynamic_bar(plot_data_standardized, summary_stats, "Photo_avg", "Hours", light_theme_color, 1)) + 
+            plot_layout(ncol = 3)
+
+act_dashboard <- (p_act / r1) + 
+  plot_layout(heights = c(3, 1.2)) + 
+  theme(
+    # 1. Force legend to the bottom 
+    legend.position = "bottom",
+    
+    # 2. Ensure it's centered
+    legend.justification = "center",
+    legend.direction = "horizontal",
+  
+    
+    # 4. Clean up the legend look
+    legend.background = element_blank(),
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9)
+  )
+
+# --- 2. Print and Save ---
+print(act_dashboard)
+
+ggsave(
+  here("Figures", "NPCRA_and_light", "Figure 2.jpg"), 
+  plot = act_dashboard, 
+  width = 10, 
+  height = 11, 
+  dpi = 600
+)
+
+# --- 1.  Light Variables 
+
+light_vars_clean <- c("RA_light", "IS_light", "IV_light", "LRI", "B10_GM_lux", "D5_GM_lux", 
+                      "avg_wake_light", "avg_postwake_light", "avg_prebed_light")
+
+middle_row_title_style <- theme(
+  plot.title = element_text(size = 11, face = "bold", hjust = 0.5, margin = margin(b = 10)),
+  strip.text = element_blank() 
+)
+
+
+p_audit_row <- (
+  # 1. TAT
+  make_tat_stacked(final_metrics_combined) + 
+    labs(title = "TAT") + 
+    theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5)) |
+  
+  # 2. Cumulative Dose ors)
+  make_dose_curve(final_imputed_all) + 
+    labs(title = "Cumulative Dose") +
+    theme(plot.title = element_text(size = 11, face = "bold", hjust = 0.5)) |
+  
+  # 3. Photoperiod
+  make_dynamic_bar(plot_data_standardized, summary_stats, "Photo_avg", "Hours", light_theme_color, 1) + 
+    labs(title = "Photoperiod") +
+    scale_y_continuous(limits = c(0, 16), breaks = seq(0, 16, by = 4)) +
+    theme(
+      strip.text = element_blank(), 
+      plot.title = element_text(size = 11, face = "bold", hjust = 0.5)
+    )
+) + plot_layout(widths = c(1, 1.2, 1)) 
+
+
+p_light_top <- make_dynamic_bar(plot_data_standardized, summary_stats, light_vars_clean, "Lux / Regularity", light_theme_color, 3)
+
+r2_timing <- make_full_rose_wedges(plot_data_standardized, summary_stats, c("B10_start_hour", "D5_start_hour"), light_rose_palette)
+r3_niche  <- make_full_rose_wedges(plot_data_standardized, summary_stats, c("FLiT_250_avg", "MLiT_250_avg", "LLiT_250_avg"), niche_palette)
+
+# --- 2. Assembly ---
+light_dashboard_final <- (p_light_top / p_audit_row / r2_timing / r3_niche) + 
+  plot_layout(heights = c(4, 1.2, 1.2, 1.2))+ 
+  theme(axis.title.x = element_blank())
+
+
+print(light_dashboard_final)
+
+ggsave(
+  here("Figures", "NPCRA_and_light", "Figure 3.jpg"), 
+  plot = light_dashboard_final, 
+  width = 9, 
+  height = 12, 
+  dpi = 600
+)
+```
+
+# LMM Function
+```{r, lmm}
+library(lme4)
+library(emmeans)
+library(tidyverse)
+
+format_seconds_to_hhmm <- function(seconds) {
+  purrr::map_chr(seconds, function(s) {
+    if (is.na(s)) return(NA_character_)
+    
+    is_neg <- s < 0
+    abs_secs <- abs(s)
+    
+    hh <- floor(abs_secs / 3600)
+    mm <- floor((abs_secs %% 3600) / 60)
+    
+    sign_str <- if(is_neg) "-" else ""
+    sprintf("%s%02d:%02d", sign_str, hh, mm)
+  })
+}
+# ==============================================================================
+# 10. DAILY LEVEL LMM WITH WITHIN-SUBJECT COHEN'S D
+# ==============================================================================
+
+get_daily_lmm_stats <- function(df, metric_var, id_col = "id", week_col = "week") {
+  
+  # 1. Prepare Data
+  df_mod <- df %>%
+    rename(Id = all_of(id_col), Week_Orig = all_of(week_col)) %>%
+    mutate(Value = as.numeric(.data[[metric_var]])) %>%
+    filter(!is.na(Value)) %>%
+    mutate(Week = factor(Week_Orig, levels = c("BSL", "1", "2", "3", "4")))
+
+  if(nrow(df_mod) == 0) return(NULL)
+
+  # 2. Fit Model
+  fit <- lme4::lmer(Value ~ Week + (1|Id), data = df_mod, 
+                    control = lmerControl(optimizer = "nloptwrap"))
+  
+  em <- emmeans::emmeans(fit, ~ Week)
+  ct <- as.data.frame(emmeans::contrast(em, method = "trt.vs.ctrl", ref = 1, infer = TRUE))
+  
+  # 3. Cohen's d (Within-subject)
+  id_weekly_means <- df_mod %>%
+    group_by(Id, Week) %>%
+    summarise(m_val = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = Week, values_from = m_val)
+
+  cohen_d_results <- map_df(c("1", "2", "3", "4"), function(w) {
+    if(w %in% names(id_weekly_means) && "BSL" %in% names(id_weekly_means)) {
+      diffs <- na.omit(id_weekly_means[[w]] - id_weekly_means$BSL)
+      d_val <- if(length(diffs) > 1) mean(diffs) / sd(diffs) else NA_real_
+    } else { d_val <- NA_real_ }
+    tibble(contrast_week = w, d = d_val)
+  })
+
+  # 4. Detect Timing Metrics for Circular Logic
+  is_timing <- grepl("hour|start|LiT|_avg$", metric_var, ignore.case=TRUE) && 
+               !grepl("days|missing|act_avg|L5_act|lux|Hrs|TAT", metric_var, ignore.case=TRUE)
+
+  desc <- df_mod %>%
+    group_by(Week) %>%
+    summarise(
+      m = if(is_timing) circular_mean_hours(Value) else mean(Value),
+      s = if(is_timing) circular_sd_hours(Value) else sd(Value),
+      .groups = "drop"
+    )
+
+  # 5. Formatting Rows
+  bsl_row <- tibble(
+    Week = "Baseline",
+    Mean_SD = if(is_timing) 
+                 paste0(format_seconds_to_hhmm(desc$m[desc$Week=="BSL"]*3600), " (", format_seconds_to_hhmm(desc$s[desc$Week=="BSL"]*3600), ")")
+              else sprintf("%.2f (%.2f)", desc$m[desc$Week=="BSL"], desc$s[desc$Week=="BSL"]),
+    Diff = "", CI = "", d = ""
+  )
+
+  trt_rows <- ct %>%
+    mutate(w_num = str_extract(contrast, "\\d")) %>%
+    left_join(cohen_d_results, by = c("w_num" = "contrast_week")) %>%
+    mutate(
+      Week = paste("Week", w_num),
+      Mean_SD = {
+        idx <- match(w_num, desc$Week)
+        if(is_timing) paste0(format_seconds_to_hhmm(desc$m[idx]*3600), " (", format_seconds_to_hhmm(desc$s[idx]*3600), ")")
+        else sprintf("%.2f (%.2f)", desc$m[idx], desc$s[idx])
+      },
+      Diff = if(is_timing) format_seconds_to_hhmm(estimate*3600) else sprintf("%.2f", estimate),
+      CI = if(is_timing) paste0(format_seconds_to_hhmm(lower.CL*3600), " to ", format_seconds_to_hhmm(upper.CL*3600))
+           else sprintf("%.2f to %.2f", lower.CL, upper.CL),
+      d = sprintf("%.2f", d)
+    ) %>%
+    select(Week, Mean_SD, Diff, CI, d)
+
+  return(bind_rows(bsl_row, trt_rows) %>% mutate(Metric = metric_var))
+}
+
+```
+
+# Create LMM Results Table
+```{r, fig.width=6, fig.height=12}
+
+# --- 1. Get Descriptive Stats for Recording Details ---
+recording_vars <- metric_lookup %>% 
+  filter(Category == "RECORDING DETAILS") %>% 
+  pull(var)
+
+recording_descriptives <- final_metrics_combined %>%
+  group_by(week) %>%
+  summarise(across(all_of(intersect(recording_vars, colnames(.))), list(
+    m = ~ if(grepl("Photo|Duration", cur_column())) circular_mean_hours(.x) else mean(.x, na.rm = TRUE),
+    s = ~ if(grepl("Photo|Duration", cur_column())) circular_sd_hours(.x) else sd(.x, na.rm = TRUE)
+  )), .groups = "drop") %>%
+  pivot_longer(cols = -week, names_to = "metric_stat", values_to = "val") %>%
+  separate(metric_stat, into = c("Metric", "stat"), sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = stat, values_from = val) %>%
+  mutate(
+    Week = factor(week, levels = c("BSL", "1", "2", "3", "4"), 
+                  labels = c("Baseline", "Week 1", "Week 2", "Week 3", "Week 4")),
+    Mean_SD = case_when(
+      grepl("missing", Metric) ~ sprintf("%.1f%%", m * 100),
+      grepl("Photo|Duration", Metric) ~ paste0(format_seconds_to_hhmm(m*3600), " (", format_seconds_to_hhmm(s*3600), ")"),
+      TRUE ~ sprintf("%.1f (%.1f)", m, s)
+    ),
+    Diff = "", CI = "", d = "" 
+  ) %>%
+  select(Metric, Week, Mean_SD, Diff, CI, d)
+# Define analysis set (excluding recording details)
+target_vars <- metric_lookup %>% 
+  filter(Category != "RECORDING DETAILS") %>% 
+  pull(var)
+
+# Filter for variables 
+existing_vars <- intersect(target_vars, colnames(final_metrics_combined))
+
+# Run loop
+all_lmm_results <- map_df(existing_vars, ~get_daily_lmm_stats(final_metrics_combined, .x))
+
+# Generate Table
+
+final_combined_results <- bind_rows(recording_descriptives, all_lmm_results)
+
+# --- 3. Create the Final Flextable ---
+lmm_master_report <- final_combined_results %>%
+  inner_join(metric_lookup, by = c("Metric" = "var")) %>%
+  select(Category, Variable = Pretty_Name, Week, Mean_SD, Diff, CI, d) %>%
+  # Ensure Week is a character for clean display in Baseline rows
+  mutate(across(c(Diff, CI, d), ~if_else(Week == "Baseline", "", .x))) %>%
+  as_grouped_data(groups = "Category") %>%
+  flextable() %>%
+  bold(i = ~ !is.na(Category), part = "body") %>%
+  bg(i = ~ !is.na(Category), bg = "#F7F7F7", part = "body") %>%
+  merge_v(j = "Variable") %>% 
+  valign(j = "Variable", valign = "top") %>%
+  set_header_labels(Mean_SD = "Mean (SD)", Diff = "Adj diff", d = "ES (d)") %>%
+  hline(i = ~ !is.na(Variable), part = "body", border = officer::fp_border(color="gray80")) %>%
+  
+  # Re-add footnotes 
+  footnote(i = ~ grepl("Hour|Timing|Onset|FLiT|MLiT|LLiT", Variable), j = 2,
+           value = as_paragraph("Circular statistics used for timing."), ref_symbols = "1") %>%
+  footnote(i = ~ grepl("Lux|GM", Variable), j = 2,
+           value = as_paragraph("Geometric mean on log-transformed data."), ref_symbols = "2") %>%
+  footnote(i = ~ grepl("Stability|Variability|Amplitude|Index|SRI|LRI", Variable), j = 2,
+           value = as_paragraph("Weekly-level rhythm metrics."), ref_symbols = "3") %>%
+  autofit()
+
+# --- 4. Export to Word ---
+doc <- read_docx() %>%
+  body_add_par("Actigraphy & Light Summary Table", style = "heading 1") %>%
+  body_add_flextable(lmm_master_report) 
+
+print(doc, target = paste0("Full_Actigraphy_Results_", Sys.Date(), ".docx"))
+
+library(officer)
+library(flextable)
+
+
+light_out_dir <- here::here("Output", "NPCRA_and_light")
+
+doc_out <- file.path(light_out_dir, paste0("NPCRA_Light_LMM_Results", ".docx"))
+
+doc <- read_docx() %>%
+  body_add_par("Light & Activity Analysis Summary", style = "heading 1") %>%
+  body_add_flextable(lmm_master_report)
+
+print(doc, target = doc_out)
+
+cat("Success! Figures and Reports saved to:", light_out_dir)
+```
+
+
+# Figures to show imputation process
+```{r, figure1, fig.width=12, fig.height=8}
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+
+
+set.seed(Sys.time()) 
+target_id <- sample(unique(id_lookup$id), 1)
+
+# Get anonymous label for the title/annotation
+masked_id <- as.character(id_lookup$masked_id[id_lookup$id == target_id])
+
+message("Randomly selected Participant: ", target_id, " (Masked ID: ", masked_id, ")")
+
+# Filter main data and gaps
+audit_target <- audit_final %>% filter(id == target_id) %>% left_join(id_lookup, by = "id")
+gaps_target  <- red_gaps_master %>% filter(id == target_id) %>% left_join(id_lookup, by = "id")
+impute_target <- final_imputed_all %>% filter(id == target_id)
+
+
+impute_target_prepared <- impute_target %>%
+  group_by(Timepoint) %>%
+  mutate(
+   
+    Time_In_Facet = as.numeric(difftime(Datetime, min(Datetime), units = "days")),
+    # 
+    Days_From_Start = floor(Time_In_Facet)
+  ) %>%
+  ungroup()
+
+
+message("Success! 'impute_target_prepared' created for Participant ", target_id)
+
+
+p1_light <- ggplot(audit_target, aes(x = Days_From_Start)) +
+  geom_rect(data = gaps_target, aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), 
+            fill = "red", alpha = 0.3, inherit.aes = FALSE) +
+  geom_line(aes(y = light), color = "orange", linewidth = 0.3) +
+  scale_y_log10(expand = expansion(mult = c(0, 0.05))) + 
+  
+  scale_x_continuous(expand = c(0, 0), breaks = seq(0, 30, by = 5)) +
+  facet_wrap(~Timepoint, ncol = 2, scales = "free_x") + 
+  theme_classic() +
+  labs(y = "Lux (Log10)", x = NULL) +
+  theme(strip.text = element_text(face = "bold", size = 14),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.spacing.x = unit(0.2, "lines"),
+        axis.line = element_line(color = "black"))
+
+# --- 2. The Activity Trace (Black) ---
+p2_act <- ggplot(audit_target, aes(x = Days_From_Start)) +
+  geom_rect(data = gaps_target, aes(xmin = start, xmax = end, ymin = 0, ymax = Inf), 
+            fill = "red", alpha = 0.3, inherit.aes = FALSE) +
+  geom_line(aes(y = activity), color = "black", linewidth = 0.3) +
+  scale_y_sqrt(expand = expansion(mult = c(0, 0.05))) + 
+
+  scale_x_continuous(expand = c(0, 0), breaks = seq(0, 30, by = 5)) +
+  facet_wrap(~Timepoint, ncol = 2, scales = "free_x") + 
+  theme_classic() +
+  labs(y = "Activity Counts", x = "Day") +
+  theme(strip.text = element_blank(),
+        panel.spacing.x = unit(0.2, "lines"),
+        axis.line = element_line(color = "black"))
+
+
+p3_actogram <- impute_target %>%
+  mutate(Time = hms::as_hms(Datetime), Date = as.Date(Datetime)) %>%
+  pivot_longer(cols = c(light, light_imputed), names_to = "Status", values_to = "Val") %>%
+  mutate(Status = factor(Status, levels = c("light", "light_imputed"), 
+                         labels = c("Pre-Imputation", "Post-Imputation"))) %>%
+  ggplot(aes(x = Time, y = Date)) +
+  geom_tile(aes(fill = log10(Val + 1))) +
+  scale_fill_viridis_c(option = "plasma", na.value = "white", name = "Log(Lux)") +
+  facet_wrap(~Status, ncol = 2) + 
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "right", 
+    legend.title = element_text(face = "bold"),
+    axis.title = element_text(face = "bold")
+  ) +
+  labs(x = "Time of Day", y = "Date")
+
+# --- 2.Assembly ---
+# We stack A and B first, then add C. 
+# Using & theme() at the very end ensures the tags match perfectly.
+fig1_final <- (p1_light / p2_act / p3_actogram) + 
+  plot_layout(heights = c(1, 1, 2.8)) +
+  plot_annotation(tag_levels = 'A') + 
+  theme(plot.tag = element_text(size = 14))
+
+fig1_final
+# --- 1. Define and Create the Directory ---
+fig_path_npcra <- here::here("Figures", "NPCRA_and_light")
+
+if (!dir.exists(fig_path_npcra)) {
+  dir.create(fig_path_npcra, recursive = TRUE)
+}
+
+# --- 2. Save Figure 1
+ggsave(
+  filename = file.path(fig_path_npcra, paste0("Figure 1", ".jpg")), 
+  plot = fig1_final, 
+  width = 12,   
+  height = 10,  
+  dpi = 600, 
+  bg = "white"
+)
+
+cat("Success! Figures saved to:", fig_path_npcra)
+
+library(tidyverse)
+library(viridis)
+
+# --- 1. Prepare Cohort-wide Data ---
+
+supplementary_audit_data <- final_imputed_all %>%
+  mutate(
+    Date = as.Date(Datetime),
+    id = as.character(id) 
+  ) %>%
+  group_by(id, Date) %>%
+  summarise(
+    uptime_pct = (sum(!is.na(light)) / 1440) * 100, 
+    .groups = "drop"
+  ) %>%
+  
+  left_join(id_lookup %>% mutate(id = as.character(id)), by = "id") %>%
+  
+  mutate(masked_id = if("masked_id" %in% names(.)) factor(masked_id) else factor(id))
+
+
+message("Rows successfully joined: ", nrow(filter(supplementary_audit_data, !is.na(masked_id))))
+
+# --- 2. Create the Calendar Heatmap ---
+fig_s1_audit <- ggplot(supplementary_audit_data, aes(x = Date, y = masked_id)) +
+  
+  geom_tile(aes(fill = uptime_pct), color = "white", linewidth = 0.1) +
+  
+  scale_fill_viridis_c(
+    option = "mako", 
+    name = "% Day Recorded",
+    labels = function(x) paste0(x, "%")
+  ) +
+  scale_x_date(
+    date_breaks = "1 week", 
+    date_labels = "%b %d",
+    expand = c(0,0)
+  ) +
+  theme_minimal() +
+  labs(
+    x = "Calendar Date",
+    y = "Participant ID"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.y = element_text(size = 9, face = "bold"),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11, color = "grey30")
+  )
+
+fig_s1_audit
+
+ggsave(
+  filename = file.path(fig_path_npcra, paste0("Figure S1", ".jpg")), 
+  plot = fig_s1_audit, 
+  width = 14,   
+  height = 10,  
+  dpi = 600, 
+  bg = "white"
+)
+
+```
+
+
