@@ -169,6 +169,49 @@ adherence_summary <- adherence_joined %>%
 knitr::kable(adherence_summary, 
              caption = "Time Gap between PANAS Completion and Sleep Diary Timestamps",
              col.names = c("Session", "Avg Mins", "SD Mins", "N", "Avg (HH:MM)", "SD (HH:MM)"))
+
+
+library(tidyverse)
+library(hms)
+
+panas_circular_stats <- panas_standardized %>%
+  mutate(
+    # 1. Convert completion time to decimal hours
+    comp_hour_dec = hour(panas_comp_dt) + (minute(panas_comp_dt) / 60),
+    # 2. Convert hours to Radians (0-24 -> 0-2pi)
+    angle_rad = (comp_hour_dec / 24) * 2 * pi
+  ) %>%
+  group_by(time_of_day) %>%
+  summarise(
+    n_obs = n(),
+    mean_sin = mean(sin(angle_rad), na.rm = TRUE),
+    mean_cos = mean(cos(angle_rad), na.rm = TRUE),
+    # R is the mean resultant length (0 to 1). 
+    # Closer to 1 means the times are very tightly clustered.
+    R = sqrt(mean_sin^2 + mean_cos^2),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # 3. Calculate Mean Angle and convert back to 24h decimal
+    avg_rad = atan2(mean_sin, mean_cos),
+    avg_hour_dec = (avg_rad * 24) / (2 * pi),
+    avg_hour_dec = ifelse(avg_hour_dec < 0, avg_hour_dec + 24, avg_hour_dec),
+    
+    # 4. Calculate Circular Standard Deviation
+    # Formula: sqrt(-2 * log(R)) in radians, then converted to hours
+    sd_rad = sqrt(-2 * log(R)),
+    sd_hour_dec = (sd_rad * 24) / (2 * pi),
+    
+    # 5. Format as readable HMS
+    avg_clock_time = as_hms(round(avg_hour_dec * 3600)),
+    sd_clock_time  = as_hms(round(sd_hour_dec * 3600))
+  )
+
+# Display the results
+knitr::kable(panas_circular_stats %>% 
+               select(time_of_day, n_obs, avg_clock_time, sd_clock_time), 
+             caption = "Circular Mean and SD of PANAS Completion Times",
+             col.names = c("Session", "N", "Mean Clock Time", "Circular SD"))
 ```
 
 # Weekly summaries
@@ -240,7 +283,7 @@ print(p)
 
 # 5. Save plot to files (Figure 3)
 ggsave(
-  filename = file.path(fig_dir, "Figure 3.tiff"), 
+  filename = file.path(fig_dir, "Figure 3.tif"), 
   plot = p, 
   width = 6, 
   height = 4.5, 
