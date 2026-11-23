@@ -930,6 +930,157 @@ ggsave(
 message("Success! Plot saved to: ", output_path)
 ```
 
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# 1. PATH SETUP (Now platform-independent)
+input_path <- here::here("Data", "raw", "EEG", "hypnograms_txt")
+
+# 2. Verify and Load
+if (!dir.exists(input_path)) {
+  stop("Path not found! Check if 'Data/raw/EEG/hypnograms_txt' exists in your Project folder.")
+}
+
+all_files <- list.files(input_path, pattern = "\\.txt$", full.names = TRUE, ignore.case = TRUE)
+
+cat("Success! Found", length(all_files), "files in:", input_path)
+all_files <- list.files(input_path, pattern = "\\.txt$", full.names = TRUE)
+
+# --- 1. UPDATED LOADER (Ensures Real_ID exists) ---
+read_hypno_by_date <- function(f) {
+  fname <- basename(f)
+  
+  # Extract ID (First 3 digits) and Date (YYYY_MM_DD)
+  subj_id  <- stringr::str_extract(fname, "^\\d{3}")
+  date_str <- stringr::str_extract(fname, "\\d{4}_\\d{2}_\\d{2}")
+  
+  # Skip file if naming doesn't match expected pattern
+  if(is.na(subj_id) | is.na(date_str)) return(NULL)
+  
+  # Read the numeric data
+  df <- tryCatch({
+    read.table(f, header = FALSE, sep = "") 
+  }, error = function(e) return(NULL))
+  
+  if(is.null(df) || ncol(df) < 1) return(NULL)
+  
+  # Standardize and add metadata
+  df %>%
+    rename(stage = V1, exclude = V2) %>%
+    mutate(
+      stage_name = case_when(
+        stage == 6 ~ "Artefact",
+        stage == 0 ~ "Wake", stage == 1 ~ "N1", stage == 2 ~ "N2",
+        stage == 3 ~ "N3", stage %in% c(4, 5) ~ "REM", TRUE ~ NA_character_
+      ),
+      # ENSURE THESE COLUMNS ARE CREATED FOR EVERY ROW
+      Real_ID = paste0("REST_", subj_id),
+      file_date = lubridate::ymd(date_str),
+      is_bsl = str_detect(fname, "(?i)Bsl|Baseline")
+    )
+}
+
+# --- 2. RUN THE LOADING ---
+raw_master <- purrr::map_df(all_files, read_hypno_by_date)
+
+# Check if Real_ID actually exists now
+if(!"Real_ID" %in% names(raw_master)) stop("Real_ID column missing after load!")
+
+# --- 3. UNBLINDING AND LABELING ---
+unblinded_master <- raw_master %>%
+  group_by(Real_ID) %>%
+  # Ensure chronological order per participant
+  arrange(file_date, .by_group = TRUE) %>%
+  mutate(
+    day_type = if_else(is_bsl, "BSL", "Intervention")
+  ) %>%
+  # Now, within each participant, rank the 'Intervention' nights
+  group_by(Real_ID, day_type) %>%
+  mutate(
+    night_num = if_else(day_type == "Intervention", dense_rank(file_date), NA_integer_)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    # Final Labeling
+    day_label = case_when(
+      day_type == "BSL" ~ "BSL",
+      night_num == 8 ~ "FU", # Logic: If 8th night after BSL, it's Follow Up
+      !is.na(night_num) ~ paste0("Night ", night_num),
+      TRUE ~ "Other"
+    ),
+    day_label = factor(day_label, levels = c("BSL", paste0("Night ", 1:7), "FU"))
+  )
+
+library(ggplot2)
+library(dplyr)
+
+# 1. CALCULATE ARTEFACT % PER NIGHT
+library(ggplot2)
+library(dplyr)
+
+# 1. CALCULATE ARTEFACT % 
+# We use unblinded_master which you just re-loaded
+art_summary_unblinded <- unblinded_master %>%
+  group_by(Real_ID, day_label) %>%
+  summarise(
+    total_epochs = n(),
+    art_epochs = sum(stage == 6),
+    art_pct = (art_epochs / total_epochs) * 100,
+    .groups = "drop"
+  )
+
+# 1. Update the required labels to match the factor levels exactly
+# We need "BSL", "Night 1", "Night 2", etc.
+full_required_labels <- c("BSL", paste0("Night ", 1:7))
+
+# 2. Re-filter the data
+art_completers_final <- art_summary_unblinded %>%
+  mutate(Real_ID_raw = gsub("REST_", "", Real_ID)) %>% 
+  filter(Real_ID_raw %in% gsub("REST_", "", completers_ids)) %>%
+  left_join(id_map_completers %>% mutate(Real_ID_raw = gsub("REST_", "", Real_ID)), 
+            by = "Real_ID_raw") %>%
+  # FIX: Match the "Night X" format
+  filter(day_label %in% full_required_labels) %>%
+  filter(!is.na(anon_id))
+
+# 3. Generate the Plot
+p_art_indiv <- ggplot(art_completers_final, aes(x = day_label, y = art_pct, group = anon_id)) +
+  geom_line(color = "#7D3C98", linewidth = 1) + 
+  geom_point(color = "#7D3C98", size = 2) +
+  # Use drop = FALSE to keep the X-axis consistent across facets
+  facet_wrap(~ anon_id, ncol = 4, axes = "all") +
+  theme_classic() +
+  labs(
+    title = "Individual Artefact Trajectories (1st week completers)",
+    subtitle = "Percentage of artfact epochs per night",
+    x = "Study Night",
+    y = "Artefact %"
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(p_art_indiv)
+
+# Define the output path clearly
+output_path_art <- here::here("Figures", "EEG", "Artefact_epochs_completers.png")
+
+# Save the plot with specific dimensions for clarity
+ggsave(
+  filename = output_path_art,
+  plot = p_art_indiv,
+  width = 9, 
+  height = 6, 
+  dpi = 300,
+  bg = "white" # Ensures a clean background for publications
+)
+
+cat("Success! Individual artefact trajectories saved to:", output_path_art)
+```
+
 # Adaptation nights 
 ```{r, fig.width=12, fig.height=20, warning=FALSE, message=FALSE}}
 # --- 1. SETUP HELPERS & MAPPINGS ---
@@ -1013,7 +1164,10 @@ clean_prep <- clean %>%
 
 # 4. Bind them - Now they are both numeric and in the right units!
 full_timeline_df <- dplyr::bind_rows(adapt_prep, clean_prep) %>%
-  dplyr::mutate(day = factor(day, levels = c("AD", "BSL", "1", "2", "3", "4", "5", "6", "7", "FU")))
+  dplyr::mutate(day = factor(day,
+  levels = c("AD", "BSL", "1", "2", "3", "4", "5", "6", "7", "FU"),
+  labels = c("AD", "BSL", "1", "2", "3", "4", "5", "6", "7", "28")
+))
 
 # --- 3. PIVOT & PLOT ---
 
@@ -1161,6 +1315,232 @@ ggsave(
   dpi = 300
 )
 ```
+
+
+```{r}
+# 1. Filter for participants with BSL and ALL 7 nights of SRT
+completers_ids <- clean %>%
+  filter(day %in% c("BSL", "1", "2", "3", "4", "5", "6", "7")) %>%
+  group_by(Real_ID) %>%
+  # Count unique days present for each person in the BSL + SRT1-7 set
+  summarise(n_days = n_distinct(day), .groups = "drop") %>%
+  filter(n_days == 8) %>% # 1 (BSL) + 7 (SRT) = 8 total required nights
+  pull(Real_ID)
+
+# 2. Calculate Cumulative Loss
+sleep_loss_analysis <- clean %>%
+  filter(Real_ID %in% completers_ids) %>%
+  filter(day %in% c("BSL", "1", "2", "3", "4", "5", "6", "7")) %>%
+  select(Real_ID, day, TST = `TST (mins)`) %>%
+  pivot_wider(names_from = day, values_from = TST) %>%
+  # Calculate daily loss relative to BSL and sum it up
+  mutate(
+    loss_n1 = BSL - `1`,
+    loss_n2 = BSL - `2`,
+    loss_n3 = BSL - `3`,
+    loss_n4 = BSL - `4`,
+    loss_n5 = BSL - `5`,
+    loss_n6 = BSL - `6`,
+    loss_n7 = BSL - `7`,
+    total_cumulative_loss_mins = loss_n1 + loss_n2 + loss_n3 + loss_n4 + loss_n5 + loss_n6 + loss_n7,
+    total_cumulative_loss_hrs = total_cumulative_loss_mins / 60
+  )
+
+# --- RESULTS ---
+n_completers <- length(completers_ids)
+avg_loss_hrs <- mean(sleep_loss_analysis$total_cumulative_loss_hrs, na.rm = TRUE)
+sd_loss_hrs  <- sd(sleep_loss_analysis$total_cumulative_loss_hrs, na.rm = TRUE)
+
+cat("--- Sleep Debt Analysis ---\n")
+cat("Number of participants with complete BSL + 7 SRT nights (n):", n_completers, "\n")
+cat("Mean Cumulative Sleep Loss (SD):", round(avg_loss_hrs, 2), "(", round(sd_loss_hrs, 2), ") hours\n")
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# 1. Define the mandatory sequence
+required_nights <- c("BSL", "1", "2", "3", "4", "5", "6", "7")
+
+# 2. Identify strict completers (No missing SRT nights)
+completers_ids <- clean %>%
+  # Filter for the target window only
+  filter(day %in% required_nights) %>%
+  # Ensure the TST value actually exists for that night
+  filter(!is.na(`TST (mins)`)) %>% 
+  group_by(Real_ID) %>%
+  # Count how many of the specific 'required_nights' they have
+  summarise(n_required = n_distinct(day), .groups = "drop") %>%
+  # Only keep those who have 8/8
+  filter(n_required == 8) %>% 
+  pull(Real_ID)
+
+# 3. Create Anonymous Mapping (Alphabetical based on ID)
+id_map_completers <- data.frame(Real_ID = sort(completers_ids)) %>%
+  mutate(anon_id = paste("Participant", LETTERS[row_number()]))
+
+# 4. Filter and Prepare Data
+tst_completers_data <- clean %>%
+  filter(Real_ID %in% completers_ids) %>%
+  left_join(id_map_completers, by = "Real_ID") %>%
+  filter(day %in% required_nights) %>%
+  mutate(day = factor(day, levels = required_nights))
+
+# 5. Generate the Plot
+p_tst_strict <- ggplot(tst_completers_data, aes(x = day, y = `TST (mins)`, group = anon_id)) +
+  geom_line(color = "#1B4F72", linewidth = 1) +
+  geom_point(color = "#1B4F72", size = 2) +
+  facet_wrap(~ anon_id, ncol = 4, axes = "all") +
+  theme_classic() +
+  labs(
+    title = "Individual TST Trajectories (Completers Only)",
+    x = "Study Night",
+    y = "Total Sleep Time (minutes)"
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    panel.spacing = unit(1.2, "lines"),
+    axis.text.x = element_text(size = 9)
+  )
+
+# 6. Display and Save
+print(p_tst_strict)
+
+ggsave(
+  filename = here::here("Figures", "EEG", "Individual_TST_Completers.png"),
+  plot = p_tst_strict,
+  width = 8, 
+  height = 5, 
+  dpi = 300
+)
+
+cat("Successfully plotted", length(completers_ids), "strict completers.")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# --- 1. RE-DEFINE THE SMART CONVERTER ---
+convert_to_minutes_smart <- function(x) {
+  x_num <- as.numeric(as.character(x))
+  dplyr::case_when(
+    is.na(x_num) ~ NA_real_,
+    # If it's a tiny decimal (Excel serial), convert to minutes
+    x_num > 0 & x_num < 2 ~ x_num * 1440, 
+    # If it's a massive number (Seconds), convert to minutes
+    x_num > 1440 ~ x_num / 60,
+    # Otherwise, assume it's already in minutes
+    TRUE ~ x_num
+  )
+}
+
+# --- 2. RE-BUILD ADAPT_PREP ---
+adapt_path <- here::here("Data", "raw", "EEG", "adaptation_night_sleep_profile")
+adapt_files <- list.files(adapt_path, pattern = "\\.xlsx$", full.names = TRUE)
+
+# Loader for AD files
+read_adapt_only <- function(f) {
+  df <- readxl::read_excel(f, skip = 1, col_types = "text")
+  colnames(df) <- make.unique(colnames(df))
+  df$Real_ID <- stringr::str_extract(basename(f), "^\\d{3}")
+  df$day <- "AD"
+  return(df)
+}
+
+adapt_raw_df <- purrr::map_dfr(adapt_files, read_adapt_only)
+
+adapt_prep <- adapt_raw_df %>%
+  dplyr::rename(dplyr::any_of(rename_map)) %>%
+  # Now this will work because the function is defined above
+  dplyr::mutate(across(-c(Real_ID, day), convert_to_minutes_smart)) %>%
+  dplyr::mutate(Real_ID = as.character(Real_ID))
+# --- Re-build adapt_prep ---
+adapt_path <- here::here("Data", "raw", "EEG", "adaptation_night_sleep_profile")
+adapt_files <- list.files(adapt_path, pattern = "\\.xlsx$", full.names = TRUE)
+
+# Loader for AD files
+read_adapt_only <- function(f) {
+  df <- readxl::read_excel(f, skip = 1, col_types = "text")
+  colnames(df) <- make.unique(colnames(df))
+  df$Real_ID <- stringr::str_extract(basename(f), "^\\d{3}")
+  df$day <- "AD"
+  return(df)
+}
+
+# Run the loader
+adapt_raw_df <- purrr::map_dfr(adapt_files, read_adapt_only)
+
+# Clean and Convert AD data
+adapt_prep <- adapt_raw_df %>%
+  dplyr::rename(dplyr::any_of(rename_map)) %>%
+  # Use the smart converter you defined in Chunk 10
+  dplyr::mutate(across(-c(Real_ID, day), convert_to_minutes_smart)) %>%
+  dplyr::mutate(Real_ID = as.character(Real_ID))
+# 1. Identify the Strict Completers (BSL to 7) first
+required_nights <- c("BSL", "1", "2", "3", "4", "5", "6", "7")
+
+completers_ids <- clean %>%
+  filter(day %in% required_nights) %>%
+  filter(!is.na(`TST (mins)`)) %>% 
+  group_by(Real_ID) %>%
+  summarise(n_required = n_distinct(day), .groups = "drop") %>%
+  filter(n_required == 8) %>% 
+  pull(Real_ID)
+
+# 2. Create the Anonymous Mapping
+id_map_completers <- data.frame(Real_ID = sort(completers_ids)) %>%
+  mutate(anon_id = paste("Participant", LETTERS[row_number()]))
+# 1. Prepare adapt_prep (Forcing numeric)
+adapt_prep_clean <- adapt_prep %>%
+  mutate(across(-c(Real_ID, day), ~as.numeric(as.character(.x))))
+
+# 2. Prepare clean_prep (Forcing numeric)
+clean_prep_clean <- clean %>%
+  mutate(across(-c(Real_ID, day), ~as.numeric(as.character(.x))))
+
+# 3. NOW bind them together
+tst_with_ad <- bind_rows(adapt_prep_clean, clean_prep_clean) %>%
+  filter(Real_ID %in% completers_ids) %>%
+  left_join(id_map_completers, by = "Real_ID") %>%
+  # Filter for AD + the required sequence
+  filter(day %in% c("AD", required_nights)) %>%
+  mutate(day = factor(day, levels = c("AD", required_nights)))
+
+# 4. Generate the Plot
+p_tst_ad_strict <- ggplot(tst_with_ad, aes(x = day, y = `TST (mins)`, group = anon_id)) +
+  geom_line(color = "#1B4F72", linewidth = 0.8) +
+  geom_point(aes(color = (day == "AD")), size = 2) +
+  scale_color_manual(values = c("TRUE" = "#E67E22", "FALSE" = "#1B4F72")) +
+  facet_wrap(~ anon_id, ncol = 4, axes = "all") +
+  theme_classic() +
+  labs(
+    title = "Individual TST Trajectories with Adaptation Night",
+    subtitle = "Strict Completers (BSL-7) + Adaptation (AD). Orange = AD night.",
+    x = "Study Night",
+    y = "Total Sleep Time (minutes)"
+  ) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold"),
+    legend.position = "none"
+  )
+
+print(p_tst_ad_strict)
+
+ggsave(
+  filename = here::here("Figures", "EEG", "Individual_TST_with_AD.png"),
+  plot = p_tst_ad_strict,
+  width = 10, 
+  height = 6, 
+  dpi = 300
+)
+
+cat("Plotted", length(completers_ids), "completers including Adaptation nights.")
+```
+
 
 
 # Session info
