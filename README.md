@@ -9,7 +9,13 @@ This repository contains the complete analytical pipeline for processing actigra
 This project is licensed under the **Creative Commons Attribution 4.0 International (CC-BY 4.0)**. 
 See the [LICENSE](LICENSE) file for details.
 
-* You can find the pre-print here:
+* ## Preprint
+
+The preprint associated with this analysis pipeline is available on medRxiv:
+
+**[Read the RESTORE Study preprint on medRxiv](https://www.medrxiv.org/content/10.64898/2026.05.08.26348885v1)**
+
+*Insights from nine nights of self-applied, low-density sleep EEG during sleep restriction therapy: a proof-of-concept evaluation.*
 
 To run these scripts, you will need R (≥ 4.2.0) and the following packages:
 
