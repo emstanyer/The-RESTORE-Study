@@ -1,0 +1,341 @@
+---
+title: "RESTORE: Actigraphy NPCRA Analysis"
+author: "Emily Stanyer"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+    df_print: paged
+params:
+  data_dir: "Data/processed/NPCRA/"
+  data_file: "NPCRA_data_clean.xlsx"
+  out_dir: "Output/actigraphy/NPCRA"
+  fig_dir: "Output/actigraphy/NPCRA"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(purrr)
+library(hms)
+library(writexl)
+library(here) 
+library(fs)
+library(kableExtra)
+
+# 1. Define paths using here() - This solves the "Path does not exist" error
+data_path <- here(params$data_dir, params$data_file)
+out_dir   <- here(params$out_dir)
+
+# 2. Create output folder if it doesn't exist
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+# 3. Helpers
+options(scipen = 999)
+fmt2 <- function(x) ifelse(is.na(x), NA_character_, sprintf("%.2f", round(as.numeric(x), 2)))
+# Small helper: parse mixed start-hour inputs -> numeric hour mapping
+parse_start_hour_short <- function(x) {
+  x_chr <- as.character(x)
+  sapply(x_chr, function(v) {
+    if (is.na(v) || v == "") return(NA_real_)
+    v <- trimws(v)
+    # HH:MM or HH:MM:SS
+    if (grepl("^\\d{1,2}:\\d{2}(:\\d{2})?$", v)) {
+      parts <- strsplit(v, ":")[[1]]
+      h <- as.numeric(parts[1]); m <- as.numeric(parts[2])
+      if (is.na(h)) return(NA_real_)
+      if (h == 0) return(24)
+      if (h >= 1 && h <= 3) return(h + 24)
+      return(as.numeric(h) + as.numeric(m)/60)
+    }
+    num <- suppressWarnings(as.numeric(v))
+    if (!is.na(num)) {
+      if (num > 1000) return(NA_real_)       # Excel serial/date -> NA for start-hour
+      if (num > 0 && num < 2) return(num * 24) # fractional day -> hours
+      if (num >= 0 && num < 50) return(num) # already hour-scale
+    }
+    return(NA_real_)
+  }, USE.NAMES = FALSE)
+}
+
+```
+
+
+# Read NPCRA Files
+
+```{r format-data-only, message=FALSE, warning=FALSE}
+library(readxl)
+library(hms)
+library(lubridate)
+library(dplyr)
+library(stringr)
+library(readr)
+library(writexl)
+
+# Use the stable path from the setup chunk
+if (!file.exists(data_path)) {
+  stop("CRITICAL ERROR: File not found at ", data_path)
+}
+
+df <- read_excel(data_path)
+
+# Standardise required columns
+nm <- names(df)
+need <- c("id","variable","timepoint","value")
+idx <- match(need, tolower(nm))
+if (any(is.na(idx))) stop("Expected columns: id, Variable, timepoint, Value (any case).")
+names(df)[idx] <- c("id","Variable","timepoint","Value")
+
+df <- df %>%
+  mutate(
+    id = as.character(id),
+    timepoint = as.character(timepoint),
+    Variable = as.character(Variable), 
+    Value = as.numeric(Value)
+  )
+
+## keep a copy BEFORE you coerce Value to numeric
+df_raw <- read_excel(data_path)
+names(df_raw)[match(c("id","variable","timepoint","value"), tolower(names(df_raw)))] <-
+  c("id","Variable","timepoint","Value")
+
+# 1) Start-hour rows: parse "HH:MM" to a time object, then map 00->24, 01–03->25–27
+start_hours <- c("L5 Start Hour", "M10 Start Hour")
+
+# 2) Numeric rows: now coerce
+NPCRA_numeric <- df %>%                    # <- this is your df with Value as.numeric() already
+  dplyr::filter(!Variable %in% start_hours)
+
+start_NPCRA_data <- df_raw %>%
+  dplyr::filter(Variable %in% start_hours) %>%
+  mutate(t = readr::parse_time(as.character(Value), format = "%H:%M"),
+         h = as.numeric(t) / 3600,
+         Value = dplyr::case_when(
+           abs(h) < 1e-9 ~ 24,
+           h >= 1 & h <= 3 ~ h + 24,
+           TRUE ~ h
+         )) %>%
+  select(id, Variable, timepoint, Value)
+# 3) Bind (all numeric now)
+NPCRA_data <- dplyr::bind_rows(NPCRA_numeric, start_NPCRA_data)
+
+
+
+# Function to convert time format
+convert_time <- function(time_hms) {
+  if (is.na(time_hms)) return(NA)  # Handle NA values
+  
+  hour <- hour(time_hms)  # Extract hour using lubridate
+  
+  if (hour == 0) {
+    return(24)  # Convert midnight (00:00) to 24
+  } else if (hour >= 1 & hour <= 3) {
+    return(hour + 24)  # Convert 01:00 → 25, 02:00 → 26, 03:00 → 27
+  } else {
+    return(hour)  # Keep all other hours unchanged 
+  }
+}
+
+# Apply function to start hour data
+start_NPCRA_data <- start_NPCRA_data %>%
+  mutate(Value = map_dbl(Value, convert_time), 
+         Value = as.numeric(Value)) 
+
+NPCRA_data <- bind_rows(start_NPCRA_data, df) %>% 
+  mutate(Value = as.numeric(Value))
+
+```
+
+# Summary stats
+
+```{r}
+
+summary_stats_NPCRA <- NPCRA_data %>%
+  group_by(Variable, timepoint) %>%
+  summarise(
+    n = sum(!is.na(Value)),
+    mean_value = mean(Value, na.rm = TRUE),
+    sd_value   = sd(Value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    mean_value = fmt2(mean_value),
+    sd_value   = fmt2(sd_value)
+  ) %>%
+  arrange(Variable, timepoint)
+
+# Print nice table
+kable(head(summary_stats_NPCRA, 40), caption = "Mean ± SD by NPCRA Variable and Timepoint")
+ 
+```
+
+
+#Linear mixed model
+```{r}
+# ---------- Diagnostics & setup ----------
+library(dplyr)
+library(tidyr)
+library(lme4)
+library(emmeans)
+library(purrr)
+library(writexl)
+library(knitr)
+
+options(scipen = 999)  # avoid scientific notation
+fmt2 <- function(x) ifelse(is.na(x), NA_character_, sprintf("%.2f", round(as.numeric(x), 2)))
+
+# Quick diagnostics: counts per timepoint and distinct ids
+cat("Counts per timepoint:\n")
+print(NPCRA_data %>% count(timepoint) %>% arrange(timepoint))
+cat("\nDistinct ids total:", n_distinct(NPCRA_data$id), "\n")
+
+cat("\nIDs with BSL and at least one post-BSL:\n")
+print(
+  NPCRA_data %>%
+    group_by(id) %>%
+    summarise(
+      has_BSL = any(timepoint == "BSL"),
+      has_post = any(timepoint != "BSL"),
+      .groups = "drop"
+    ) %>%
+    filter(has_BSL) %>%
+    summarise(ids_with_BSL = n(), ids_with_BSL_and_post = sum(has_post))
+)
+
+# ---------- function: mirror of run_sleep_lmm but for NPCRA long format ----------
+run_NPCRA_lmm <- function(df_long, varname) {
+  # df_long: NPCRA_data long format (id, timepoint, Variable, Value)
+  # varname: character, exact Variable name to analyze (e.g., "L5 Average")
+  message("Variable: ", varname)
+  df1 <- df_long %>%
+    filter(Variable == varname) %>%
+    select(id, timepoint, Value) %>%
+    group_by(id, timepoint) %>%
+    summarise(Value = mean(as.numeric(Value), na.rm = TRUE), .groups = "drop") %>%
+    filter(!is.na(Value))
+  
+  # diagnostics
+  cat("  Observed timepoint levels:", paste(sort(unique(df1$timepoint)), collapse = ", "), "\n")
+  cat("  Distinct ids:", n_distinct(df1$id), "  Rows:", nrow(df1), "\n")
+  
+  # requirements
+  if (!("BSL" %in% df1$timepoint)) {
+    cat("  -> SKIP: no BSL present for this variable\n"); return(NULL)
+  }
+  if (n_distinct(df1$id) < 2) {
+    cat("  -> SKIP: fewer than 2 distinct ids\n"); return(NULL)
+  }
+  if (nrow(df1 %>% filter(timepoint != "BSL")) == 0) {
+    cat("  -> SKIP: no post-BSL observations\n"); return(NULL)
+  }
+  
+  # set factor levels: BSL as reference first then others in natural sorted order
+  other_levels <- setdiff(sort(unique(df1$timepoint)), "BSL")
+  df1 <- df1 %>% mutate(timepoint = factor(timepoint, levels = c("BSL", other_levels)))
+  
+  # fit LMM (safe tryCatch)
+  fit <- tryCatch(
+    lmer(Value ~ timepoint + (1 | id), data = df1, REML = TRUE),
+    error = function(e) { cat("  -> lmer ERROR:", e$message, "\n"); NULL }
+  )
+  if (is.null(fit)) return(NULL)
+  
+  # emmeans + contrasts vs BSL
+  em <- tryCatch(emmeans(fit, ~ timepoint), error = function(e) { cat("  -> emmeans ERROR:", e$message, "\n"); NULL })
+  if (is.null(em)) return(NULL)
+  
+  ct <- tryCatch({
+    contrast(em, method = "trt.vs.ctrl", ref = "BSL") %>%
+      summary(infer = TRUE, adjust = "none") %>% as.data.frame()
+  }, error = function(e) { cat("  -> contrast ERROR:", e$message, "\n"); NULL })
+  if (is.null(ct)) return(NULL)
+  
+  # pivot to wide aggregated per id so we can compute observed change pairs
+  wide <- df1 %>% pivot_wider(names_from = timepoint, values_from = Value)
+  
+  # get the 'against' week names (right-hand-side of each contrast string)
+  # contrast names typically like "Week 1 - BSL"
+  against <- gsub(" - BSL", "", ct$contrast, fixed = TRUE)
+  
+  sd_change <- sapply(against, function(w) {
+    if (all(c("BSL", w) %in% colnames(wide))) {
+      sd_val <- sd(wide[[w]] - wide$BSL, na.rm = TRUE)
+      if (is.nan(sd_val)) NA_real_ else sd_val
+    } else NA_real_
+  })
+  d_vals <- sapply(against, function(w) {
+    if (all(c("BSL", w) %in% colnames(wide))) {
+      mean_change <- mean(wide[[w]] - wide$BSL, na.rm = TRUE)
+      sd_ch <- sd(wide[[w]] - wide$BSL, na.rm = TRUE)
+      if (is.na(sd_ch) || sd_ch == 0) NA_real_ else mean_change / sd_ch
+    } else NA_real_
+  })
+  
+  # assemble results; ensure numeric CM column names exist (estimate, SE, lower.CL, upper.CL)
+  out <- ct %>%
+    mutate(
+      variable = varname,
+      estimate_num = as.numeric(estimate),
+      lower.CL = as.numeric(lower.CL),
+      upper.CL = as.numeric(upper.CL),
+      SD_change = sd_change,
+      Cohens_d = d_vals
+    ) %>%
+    transmute(
+      variable,
+      contrast,
+      estimate = estimate_num,
+      lower.CL,
+      upper.CL,
+      SD_change,
+      Cohens_d
+    )
+  
+  return(out)
+}
+
+# ---------- run for specified variables ----------
+# choose variables you want to analyze (example: numeric NPCRA variables)
+variables_to_run <- c("L5 Average", "M10 Average", "RA (Relative Amplitude)", "IS (Interdaily Stability)", "IV (Intra-daily Variability)", "L5 Start Hour", "M10 Start Hour")
+
+eff_list <- lapply(variables_to_run, function(v) run_NPCRA_lmm(NPCRA_data, v))
+eff_list <- purrr::compact(eff_list)  # drop NULL
+NPCRA_effects <- bind_rows(eff_list)
+
+# ---------- save raw numeric results ----------
+writexl::write_xlsx(NPCRA_effects, file.path(out_dir, "NPCRA_LMM_raw_results.xlsx"))
+cat("✅ Saved raw numeric results to ", file.path(out_dir, "NPCRA_LMM_raw_results.xlsx"), "\n")
+
+# ---------- format for manuscript: 2 decimals, 95% CI, Cohen's d ----------
+if (nrow(NPCRA_effects) == 0) {
+  cat("No LMM results produced for the requested variables.\n")
+} else {
+  NPCRA_results_fmt <- NPCRA_effects %>%
+    mutate(
+      estimate = as.numeric(estimate),
+      lower.CL = as.numeric(lower.CL),
+      upper.CL = as.numeric(upper.CL),
+      Cohens_d = as.numeric(Cohens_d),
+      `Estimate` = sprintf("%.2f", estimate),
+      `95% CI`   = paste0(sprintf("%.2f", lower.CL), " to ", sprintf("%.2f", upper.CL)),
+      `Cohen's d` = ifelse(is.na(Cohens_d), NA_character_, sprintf("%.2f", Cohens_d))
+    ) %>%
+    select(variable, contrast, `Estimate`, `95% CI`, `Cohen's d`) %>%
+    arrange(variable, contrast)
+  
+  # Save formatted table
+  writexl::write_xlsx(NPCRA_results_fmt, file.path(out_dir, "NPCRA_LMM_results.xlsx"))
+  cat("✅ Saved formatted manuscript table to ", file.path(out_dir, "NPCRA_LMM_results_xlsx"), "\n")
+  
+  # show table in report
+  knitr::kable(NPCRA_results_fmt, caption = "NPCRA LMM — contrasts vs Baseline (estimate, 95% CI, Cohen's d)")
+}
+
+
+```
+
+
