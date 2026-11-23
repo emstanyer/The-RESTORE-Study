@@ -73,7 +73,7 @@ panas_to_remove <- c(
 # Robust parser for SOL and WASO strings
 parse_to_mins_robust <- function(x) {
   case_when(
-    is.na(x) | x == "" ~ 0,
+   is.na(x) | x == "" ~ NA_real_,
     str_detect(x, ":") ~ as.numeric(hm(x)) / 60,
     str_detect(x, "hour") ~ as.numeric(str_extract(x, "\\d+")) * 60,
     TRUE ~ as.numeric(str_extract(x, "\\d+"))
@@ -698,5 +698,138 @@ master_table
 
 ```
 
+# Napping analysis
 
+```{r}
+# 1. Load required libraries
+library(readxl)
+library(here)
+library(dplyr)
+
+# 2. Define the file path using the here package
+nap_file_path <- here("Data", "raw", "napping", "nap_data.xlsx")
+
+# 3. Read the file
+if (file.exists(nap_file_path)) {
+  nap_data <- read_excel(nap_file_path)
+  
+  # Brief look at the data
+  head(nap_data)
+} else {
+  stop("The file 'nap_data.xlsx' was not found at the specified path.")
+}
+
+# 1. Clean Nap Data
+library(tidyverse)
+library(flextable)
+
+# 1. Direct Processing from raw data
+nap_summary_final <- nap_data %>%
+  mutate(
+    id = str_pad(as.character(id), width = 3, side = "left", pad = "0"),
+    nap_start_decimal = hour(nap_start_time) + minute(nap_start_time)/60,
+    nap_duration_mins = hour(total_nap_time) * 60 + minute(total_nap_time),
+    
+    Week_Label = case_when(
+      timepoint == "BSL" & week == 1 ~ "BSL Week 1",
+      timepoint == "BSL" & week == 2 ~ "BSL Week 2",
+      timepoint == "SRT" & week == 1 ~ "Week 1",
+      timepoint == "SRT" & week == 2 ~ "Week 2",
+      timepoint == "SRT" & week == 3 ~ "Week 3",
+      timepoint == "SRT" & week == 4 ~ "Week 4",
+      TRUE ~ "Exclude"
+    ),
+    Week_Label = factor(Week_Label, levels = c("BSL Week 1", "BSL Week 2", "Week 1", "Week 2", "Week 3", "Week 4"))
+  ) %>%
+  filter(Week_Label != "Exclude") %>%
+  group_by(Week_Label, .drop = FALSE) %>% 
+  summarise(
+    n_unique_pps = n_distinct(id, na.rm = TRUE),
+    total_naps   = n(),
+    mean_len      = mean(nap_duration_mins, na.rm = TRUE),
+    sd_len        = sd(nap_duration_mins, na.rm = TRUE),
+    avg_start_dec = mean(nap_start_decimal, na.rm = TRUE),
+    sd_start_dec  = sd(nap_start_decimal, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    `Mean Start Time (SD)` = case_when(
+      total_naps == 0 ~ "-",
+      total_naps == 1 ~ sprintf("%02d:%02d (NA)", 
+                               as.integer(floor(avg_start_dec)), 
+                               as.integer(round((avg_start_dec %% 1) * 60))),
+      TRUE ~ sprintf("%02d:%02d (%02d:%02d)", 
+                     as.integer(floor(avg_start_dec)), 
+                     as.integer(round((avg_start_dec %% 1) * 60)),
+                     as.integer(floor(sd_start_dec)), 
+                     as.integer(round((sd_start_dec %% 1) * 60)))
+    ),
+    `Mean Length (SD)` = case_when(
+      total_naps == 0 ~ "0.0 (0.0)",
+      total_naps == 1 ~ sprintf("%.1f (NA)", mean_len),
+      TRUE ~ sprintf("%.1f (%.1f)", mean_len, sd_len)
+    ),
+    `n (%) Nappers` = sprintf("%d (%.1f%%)", as.integer(n_unique_pps), (n_unique_pps / 17) * 100),
+    # Calculation for Proclivity: Total Naps / Number of Nappers
+    `Mean Naps per Napper` = ifelse(n_unique_pps > 0, 
+                                   sprintf("%.2f", total_naps / n_unique_pps), 
+                                   "0.00")
+  ) %>%
+  select(Week = Week_Label, `n (%) Nappers`, `Mean Naps per Napper`, `Mean Start Time (SD)`, `Mean Length (SD)`)
+
+# Display Table
+nap_master_table <- nap_summary_final %>%
+  flextable() %>%
+  theme_booktabs() %>%
+  autofit()
+
+nap_master_table
+
+
+# 1. Load libraries
+library(flextable)
+library(here)
+
+# 2. Define and create the directory using here
+# This ensures it's relative to your .Rproj file
+output_folder <- here("Output", "actigraphy")
+
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+}
+
+# 3. Save the table
+save_as_docx(
+  nap_master_table, 
+  path = here("Output", "actigraphy", "Napping_Analysis_Summary.docx")
+)
+```
+
+```{r}
+waso_check <- actigraphy_final_wide %>%
+  group_by(id, Week) %>%
+  summarise(
+    WASO = mean(WASO, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(Week %in% c("Baseline", "Week 1")) %>%
+  mutate(Week = as.character(Week)) %>%
+  pivot_wider(names_from = Week, values_from = WASO) %>%
+  filter(is.finite(Baseline), is.finite(`Week 1`)) %>%
+  mutate(change = `Week 1` - Baseline)
+
+# View each participant's change
+print(waso_check, n = Inf)
+
+# Calculate Cohen's dz
+waso_check %>%
+  summarise(
+    n_pairs = n(),
+    mean_baseline = mean(Baseline),
+    mean_week1 = mean(`Week 1`),
+    mean_change = mean(change),
+    sd_change = sd(change),
+    cohens_dz = mean_change / sd_change
+  )
+```
 
